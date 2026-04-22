@@ -9,7 +9,7 @@ import org.koitharu.kotatsu.parsers.site.mangahub.MangaHubParser
 
 @Broken("BLOCKED BY CLOUDFARE")
 
-@MangaSourceParser("MANGAHUB_IO", "MangaHub", "en")
+@MangaSourceParser("MANGAHUB_IO", "MangaHubIO", "en")
 internal class MangaHubIo(context: MangaLoaderContext) :
 	MangaHubParser(context, MangaParserSource.MANGAHUB_IO, "mangahub.io", "m01") {
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
