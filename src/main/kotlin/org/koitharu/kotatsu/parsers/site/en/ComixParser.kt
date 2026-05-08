@@ -10,7 +10,6 @@ import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
-import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.net.URLEncoder
@@ -116,7 +115,8 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val url = buildString {
-            append("https://comix.to/api/v2/manga?")
+            append(apiUrl("manga"))
+            append("?")
             var firstParam = true
             fun addParam(param: String) {
                 if (firstParam) {
@@ -145,15 +145,15 @@ internal class Comix(context: MangaLoaderContext) :
             // Handle genre filtering
             if (filter.tags.isNotEmpty()) {
                 for (tag in filter.tags) {
-                    addParam("genres[]=${tag.key}")
+                    addParam("genres_in[]=${tag.key}")
                 }
             }
 
             // Default exclude adult content
-            addParam("genres[]=-87264") // Adult
-            addParam("genres[]=-87266") // Hentai
-            addParam("genres[]=-87268") // Smut
-            addParam("genres[]=-87265") // Ecchi
+            addParam("genres_ex[]=87264") // Adult
+            addParam("genres_ex[]=87266") // Hentai
+            addParam("genres_ex[]=87268") // Smut
+            addParam("genres_ex[]=87265") // Ecchi
             addParam("limit=$pageSize")
             addParam("page=$page")
         }
@@ -169,19 +169,23 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private fun parseMangaFromJson(json: JSONObject): Manga {
-        val hashId = json.getString("hash_id")
+        val hashId = json.optString("hid").ifBlank { json.optString("hash_id") }
         val title = json.getString("title")
         val description = json.optString("synopsis", "").nullIfEmpty()
-        val poster = json.getJSONObject("poster")
-        val coverUrl = poster.optString("large", "").nullIfEmpty()
+        val poster = json.optJSONObject("poster")
+        val coverUrl = poster?.optString("large", "")?.nullIfEmpty()
+            ?: poster?.optString("medium", "")?.nullIfEmpty()
+            ?: poster?.optString("small", "")?.nullIfEmpty()
         val status = json.optString("status", "")
-        val year = json.optInt("year", 0)
-        val rating = json.optDouble("rated_avg", 0.0)
+        val rating = json.optDouble("ratedAvg", Double.NaN)
+            .takeUnless { it.isNaN() }
+            ?: json.optDouble("rated_avg", 0.0)
 
         val state = when (status) {
             "finished" -> MangaState.FINISHED
             "releasing" -> MangaState.ONGOING
             "on_hiatus" -> MangaState.PAUSED
+            "discontinued" -> MangaState.ABANDONED
             else -> null
         }
 
@@ -193,12 +197,12 @@ internal class Comix(context: MangaLoaderContext) :
             title = title,
             altTitles = emptySet(),
             description = description,
-            rating = if (rating > 0) (rating / 10.0f).toFloat() else RATING_UNKNOWN,
-            tags = emptySet(),
-            authors = emptySet(),
+            rating = if (rating > 0) (rating / 10.0).toFloat() else RATING_UNKNOWN,
+            tags = parseTerms(json),
+            authors = parseAuthors(json),
             state = state,
             source = source,
-            contentRating = ContentRating.SAFE,
+            contentRating = if (json.optString("contentRating") in NSFW_RATINGS) ContentRating.ADULT else ContentRating.SAFE,
         )
     }
 
@@ -207,7 +211,7 @@ internal class Comix(context: MangaLoaderContext) :
         val chaptersDeferred = async { getChapters(manga) }
 
         // Get detailed manga info
-        val detailUrl = "https://comix.to/api/v2/manga/$hashId"
+        val detailUrl = apiUrl("manga/$hashId")
         val response = webClient.httpGet(detailUrl).parseJson()
 
         if (response.has("result")) {
@@ -228,76 +232,13 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfterLast("/").substringBefore("-")
-        val chapterUrl = "https://comix.to${chapter.url}"
+        val path = "/chapters/$chapterId"
+        val chapterUrl = "${apiUrl(path)}?_=${ComixHash.generateHash(path)}"
+        val response = webClient.httpGet(chapterUrl).parseJson()
+        val pages = response.optJSONObject("result")?.optJSONArray("pages") ?: JSONArray()
 
-        // Get the chapter page HTML to extract images from the script
-        val response = webClient.httpGet(chapterUrl).parseHtml()
-
-        // Look for the images array in the JavaScript (with escaped quotes)
-        val scripts = response.select("script")
-        var images: JSONArray? = null
-
-        for (script in scripts) {
-            val scriptContent = script.html()
-
-            // Look for the images array with escaped quotes in JSON
-            if (scriptContent.contains("\\\"images\\\":[")) {
-                try {
-                    // Find the start of the images array (with escaped quotes)
-                    val imagesStart = scriptContent.indexOf("\\\"images\\\":[")
-                    val colonPos = scriptContent.indexOf(":", imagesStart)
-                    val arrayStart = scriptContent.indexOf("[", colonPos)
-
-                    // Find the matching closing bracket for the array
-                    var bracketCount = 1 // Start with 1 since we're at the opening bracket
-                    var arrayEnd = arrayStart + 1 // Start after the opening bracket
-                    var inString = false
-                    var escapeNext = false
-
-                    for (i in (arrayStart + 1) until scriptContent.length) {
-                        val char = scriptContent[i]
-
-                        if (escapeNext) {
-                            escapeNext = false
-                            continue
-                        }
-
-                        when (char) {
-                            '\\' -> escapeNext = true
-                            '"' -> inString = !inString
-                            '[' -> if (!inString) bracketCount++
-                            ']' -> if (!inString) {
-                                bracketCount--
-                                if (bracketCount == 0) {
-                                    arrayEnd = i + 1
-                                    break
-                                }
-                            }
-                        }
-                    }
-
-                    val imagesJsonString = scriptContent.substring(arrayStart, arrayEnd)
-                    // Parse the JSON array, handling escaped quotes
-                    images = JSONArray(imagesJsonString.replace("\\\"", "\""))
-                    break
-                } catch (e: Exception) {
-                    // Continue to next script if parsing fails
-                    continue
-                }
-            }
-        }
-
-        if (images == null) {
-            throw ParseException("Unable to find chapter images", chapterUrl)
-        }
-
-        return (0 until images.length()).map { i ->
-            val imageItem = images.get(i)
-            val imageUrl = when (imageItem) {
-                is String -> imageItem
-                is JSONObject -> imageItem.getString("url")
-                else -> throw ParseException("Unexpected image format", chapterUrl)
-            }
+        return (0 until pages.length()).map { i ->
+            val imageUrl = pages.getJSONObject(i).getString("url")
             MangaPage(
                 id = generateUid("$chapterId-$i"),
                 url = imageUrl,
@@ -315,9 +256,8 @@ internal class Comix(context: MangaLoaderContext) :
         // Fetch all chapters with pagination
         while (true) {
             val chaptersPath = "/manga/$hashId/chapters"
-            val time = 1L
-            val hashToken = ComixHash.generateHash(chaptersPath, 0, time)
-            val chaptersUrl = "https://comix.to/api/v2/manga/$hashId/chapters?order[number]=desc&limit=100&page=$page&time=$time&_=$hashToken"
+            val hashToken = ComixHash.generateHash(chaptersPath)
+            val chaptersUrl = "${apiUrl(chaptersPath)}?order[number]=desc&limit=100&page=$page&_=$hashToken"
             val response = webClient.httpGet(chaptersUrl).parseJson()
             val result = response.getJSONObject("result")
             val items = result.getJSONArray("items")
@@ -329,12 +269,14 @@ internal class Comix(context: MangaLoaderContext) :
             }
 
             // Check pagination info to see if we have more pages
-            val pagination = result.optJSONObject("pagination")
-            if (pagination != null) {
-                val currentPage = pagination.getInt("current_page")
-                val lastPage = pagination.getInt("last_page")
-                if (currentPage >= lastPage) break
-            }
+            val pagination = result.optJSONObject("pagination") ?: result.optJSONObject("meta")
+            val currentPage = pagination?.optIntOrNull("page")
+                ?: pagination?.optIntOrNull("current_page")
+                ?: page
+            val lastPage = pagination?.optIntOrNull("lastPage")
+                ?: pagination?.optIntOrNull("last_page")
+                ?: 1
+            if (currentPage >= lastPage) break
 
             page++
         }
@@ -342,7 +284,7 @@ internal class Comix(context: MangaLoaderContext) :
         // Group chapters by scanlation team
         val chaptersByTeam = mutableMapOf<String, MutableList<JSONObject>>()
         for (chapter in allChapters) {
-            val scanlationGroup = chapter.optJSONObject("scanlation_group")
+            val scanlationGroup = chapter.optJSONObject("group") ?: chapter.optJSONObject("scanlation_group")
             val teamName = scanlationGroup?.optString("name", null) ?: "Unknown"
             chaptersByTeam.getOrPut(teamName) { mutableListOf() }.add(chapter)
         }
@@ -363,12 +305,12 @@ internal class Comix(context: MangaLoaderContext) :
                     ?: allChapters.find { it.getDouble("number").toFloat() == chapterNumber }
                     ?: continue
 
-                val chapterId = chapterData.getLong("chapter_id")
+                val chapterId = chapterData.getLong("id")
                 val number = chapterData.getDouble("number").toFloat()
                 val name = chapterData.optString("name", "").nullIfEmpty()
-                val createdAt = chapterData.getLong("created_at")
-                val scanlationGroup = chapterData.optJSONObject("scanlation_group")
-                val actualTeamName = scanlationGroup?.optString("name", null) ?: "Unknown"
+                val scanlationGroup = chapterData.optJSONObject("group") ?: chapterData.optJSONObject("scanlation_group")
+                val actualTeamName = scanlationGroup?.optString("name", null)
+                    ?: if (chapterData.optBoolean("isOfficial")) "Official" else "Unknown"
 
                 val title = if (name != null) {
                     "Chapter $number: $name"
@@ -382,7 +324,7 @@ internal class Comix(context: MangaLoaderContext) :
                     number = number,
                     volume = 0,
                     url = "/title/$hashId/$chapterId-chapter-${number.toInt()}",
-                    uploadDate = createdAt * 1000L,
+                    uploadDate = parseRelativeDate(chapterData.optString("createdAtFormatted")),
                     source = source,
                     scanlator = actualTeamName,
                     branch = teamName,
@@ -394,25 +336,85 @@ internal class Comix(context: MangaLoaderContext) :
 
         return chaptersBuilder.toList().reversed()
     }
+
+    private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
+
+    private fun parseTerms(json: JSONObject): Set<MangaTag> {
+        val tags = LinkedHashSet<MangaTag>()
+        for (key in TERM_KEYS) {
+            tags += parseTerms(json.optJSONArray(key))
+        }
+        return tags
+    }
+
+    private fun parseTerms(array: JSONArray?): Set<MangaTag> {
+        if (array == null) return emptySet()
+        return (0 until array.length()).mapNotNullTo(LinkedHashSet()) { i ->
+            val item = array.optJSONObject(i) ?: return@mapNotNullTo null
+            val title = item.optString("title").nullIfEmpty()
+                ?: item.optString("name").nullIfEmpty()
+                ?: return@mapNotNullTo null
+            MangaTag(
+                key = title,
+                title = title,
+                source = source,
+            )
+        }
+    }
+
+    private fun parseAuthors(json: JSONObject): Set<String> {
+        val authors = json.optJSONArray("authors") ?: json.optJSONArray("author") ?: return emptySet()
+        return (0 until authors.length()).mapNotNullTo(LinkedHashSet()) { i ->
+            val item = authors.optJSONObject(i) ?: return@mapNotNullTo null
+            item.optString("title").nullIfEmpty() ?: item.optString("name").nullIfEmpty()
+        }
+    }
+
+    private fun parseRelativeDate(date: String?): Long {
+        if (date.isNullOrBlank()) return 0L
+        val match = RELATIVE_DATE_REGEX.find(date.trim().lowercase().removeSuffix(" ago")) ?: return 0L
+        val amount = match.groupValues[1].toIntOrNull() ?: return 0L
+        val calendar = Calendar.getInstance()
+        when (match.groupValues[2]) {
+            "s", "sec", "secs" -> calendar.add(Calendar.SECOND, -amount)
+            "m", "min", "mins" -> calendar.add(Calendar.MINUTE, -amount)
+            "h", "hr", "hrs" -> calendar.add(Calendar.HOUR_OF_DAY, -amount)
+            "d", "day", "days" -> calendar.add(Calendar.DAY_OF_YEAR, -amount)
+            "w", "week", "weeks" -> calendar.add(Calendar.WEEK_OF_YEAR, -amount)
+            "mo", "mos", "month", "months" -> calendar.add(Calendar.MONTH, -amount)
+            "y", "yr", "yrs", "year", "years" -> calendar.add(Calendar.YEAR, -amount)
+        }
+        return calendar.timeInMillis
+    }
+
+    private fun JSONObject.optIntOrNull(key: String): Int? {
+        return if (has(key) && !isNull(key)) optInt(key) else null
+    }
+
+    private companion object {
+        private val NSFW_RATINGS = setOf("erotica", "pornographic")
+        private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
+        private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
+    }
 }
 
 private object ComixHash {
     private val KEYS = arrayOf(
-        "13YDu67uDgFczo3DnuTIURqas4lfMEPADY6Jaeqky+w=",
-        "yEy7wBfBc+gsYPiQL/4Dfd0pIBZFzMwrtlRQGwMXy3Q=",
-        "yrP+EVA1Dw==",
-        "vZ23RT7pbSlxwiygkHd1dhToIku8SNHPC6V36L4cnwM=",
-        "QX0sLahOByWLcWGnv6l98vQudWqdRI3DOXBdit9bxCE=",
-        "WJwgqCmf",
-        "BkWI8feqSlDZKMq6awfzWlUypl88nz65KVRmpH0RWIc=",
-        "v7EIpiQQjd2BGuJzMbBA0qPWDSS+wTJRQ7uGzZ6rJKs=",
-        "1SUReYlCRA==",
-        "RougjiFHkSKs20DZ6BWXiWwQUGZXtseZIyQWKz5eG34=",
-        "LL97cwoDoG5cw8QmhI+KSWzfW+8VehIh+inTxnVJ2ps=",
-        "52iDqjzlqe8=",
-        "U9LRYFL2zXU4TtALIYDj+lCATRk/EJtH7/y7qYYNlh8=",
-        "e/GtffFDTvnw7LBRixAD+iGixjqTq9kIZ1m0Hj+s6fY=",
-        "xb2XwHNB",
+        "JxTcdyiA5GZxnbrmthXBQfU2IMTKcY1+3nNhbq98Sgo=",
+        "3PordjODbhqla382Cxapmo/1JiABJQcjiJj1+48gTJ4=",
+        "OaKvnI5ARA==",
+        "MHNBHYWA7lvy867fXgvGcJwWDk79KqUJUVFsh3RwnnI=",
+        "8i0Cru/VJBSVB2Y1GcMDVpzx2WepOcfnWdd81yxICl4=",
+        "Fyskubz8VvA=",
+        "B46L1x+UeWP+19cRpQ+OZvdLAK9EHID8g3mSgn57tew=",
+        "DTSTmUt6LpDUw9r1lSQqyb3YlFTzruT8tk8wUGkwehQ=",
+        "vY/meeI=",
+        "7xWfIF5THL5LAnRgAARg+4mjWHPU9n3PQwvzbaMNi+Q=",
+        "bewtiTuV+HJk56xxkf2iCljLgruCpBmN9BgE8i6gc9M=",
+        "/Xcb2zAu8AU=",
+        "WgeCQ3T8R51uTwVSiVa7Zy0dN6JOg6Z5JleMS+HV8Aw=",
+        "yXayUVFrrcW56jQCEfZzuCidjpnWKjTDUNT7XeX9i7k=",
+        "tSLco2w=",
     )
 
     private fun getKeyBytes(index: Int): IntArray {
@@ -450,143 +452,110 @@ private object ComixHash {
         return out
     }
 
-    private fun mutS(e: Int): Int = (e + 143) % 256
-    private fun mutL(e: Int): Int = ((e ushr 1) or (e shl 7)) and 255
-    private fun mutC(e: Int): Int = (e + 115) % 256
-    private fun mutM(e: Int): Int = e xor 177
-    private fun mutF(e: Int): Int = (e - 188 + 256) % 256
-    private fun mutG(e: Int): Int = ((e shl 2) or (e ushr 6)) and 255
-    private fun mutH(e: Int): Int = (e - 42 + 256) % 256
-    private fun mutDollar(e: Int): Int = ((e shl 4) or (e ushr 4)) and 255
-    private fun mutB(e: Int): Int = (e - 12 + 256) % 256
-    private fun mutUnderscore(e: Int): Int = (e - 20 + 256) % 256
-    private fun mutY(e: Int): Int = ((e ushr 1) or (e shl 7)) and 255
-    private fun mutK(e: Int): Int = (e - 241 + 256) % 256
-
     private fun getMutKey(mk: IntArray, idx: Int): Int =
         if (mk.isNotEmpty() && (idx % 32) < mk.size) mk[idx % 32] else 0
 
-    private fun round1(data: IntArray): IntArray {
-        val enc = rc4(getKeyBytes(0), data)
-        val mutKey = getKeyBytes(1)
-        val prefKey = getKeyBytes(2)
+    private fun opShiftRight7Left1(e: Int): Int = ((e ushr 7) or (e shl 1)) and 255
+    private fun opShiftLeft1Right7(e: Int): Int = ((e shl 1) or (e ushr 7)) and 255
+    private fun opShiftRight2Left6(e: Int): Int = ((e ushr 2) or (e shl 6)) and 255
+    private fun opShiftLeft4Right4(e: Int): Int = ((e shl 4) or (e ushr 4)) and 255
+    private fun opShiftRight4Left4(e: Int): Int = ((e ushr 4) or (e shl 4)) and 255
+
+    private fun mutate(data: IntArray, mutKey: IntArray, prefKey: IntArray, prefKeyLimit: Int, round: Int): IntArray {
         val out = mutableListOf<Int>()
-        for (i in enc.indices) {
-            if (i < 7 && i < prefKey.size) out.add(prefKey[i])
-            var v = enc[i] xor getMutKey(mutKey, i)
-            v = when (i % 10) {
-                0, 9 -> mutC(v)
-                1 -> mutB(v)
-                2 -> mutY(v)
-                3 -> mutDollar(v)
-                4, 6 -> mutH(v)
-                5 -> mutS(v)
-                7 -> mutK(v)
-                8 -> mutL(v)
+        for (i in data.indices) {
+            if (i < prefKeyLimit && i < prefKey.size) out.add(prefKey[i])
+            var v = data[i] xor getMutKey(mutKey, i)
+            v = when (round) {
+                1 -> when (i % 10) {
+                    0 -> opShiftRight7Left1(v)
+                    1 -> v xor 37
+                    2 -> v xor 81
+                    3 -> v xor 147
+                    4 -> opShiftRight2Left6(v)
+                    5, 8 -> opShiftRight4Left4(v)
+                    6 -> v xor 218
+                    7 -> (v + 159) and 255
+                    9 -> v xor 180
+                    else -> v
+                }
+                2 -> when (i % 10) {
+                    0, 9 -> v xor 180
+                    1 -> opShiftLeft1Right7(v)
+                    2 -> v xor 147
+                    3 -> opShiftRight7Left1(v)
+                    4 -> opShiftRight2Left6(v)
+                    5 -> opShiftRight4Left4(v)
+                    6, 8 -> (v + 159) and 255
+                    7 -> (v + 34) and 255
+                    else -> v
+                }
+                3 -> when (i % 10) {
+                    0 -> v xor 81
+                    1 -> opShiftRight4Left4(v)
+                    2, 9 -> opShiftLeft4Right4(v)
+                    3 -> v xor 37
+                    4 -> (v + 159) and 255
+                    5 -> opShiftLeft1Right7(v)
+                    6 -> v xor 180
+                    7 -> (v + 34) and 255
+                    8 -> opShiftRight2Left6(v)
+                    else -> v
+                }
+                4 -> when (i % 10) {
+                    0, 7 -> v xor 218
+                    1, 4 -> opShiftLeft1Right7(v)
+                    2 -> opShiftRight7Left1(v)
+                    3 -> (v + 159) and 255
+                    5, 8 -> v xor 180
+                    6 -> v xor 147
+                    9 -> v xor 37
+                    else -> v
+                }
+                5 -> when (i % 10) {
+                    0 -> opShiftLeft4Right4(v)
+                    1, 3 -> v xor 147
+                    2 -> (v + 34) and 255
+                    4, 9 -> v xor 218
+                    5, 7 -> opShiftLeft1Right7(v)
+                    6 -> v xor 180
+                    8 -> opShiftRight2Left6(v)
+                    else -> v
+                }
                 else -> v
             }
             out.add(v and 255)
         }
         return out.toIntArray()
+    }
+
+    private fun round1(data: IntArray): IntArray {
+        val mut = mutate(data, getKeyBytes(1), getKeyBytes(2), 7, 1)
+        return rc4(getKeyBytes(0), mut)
     }
 
     private fun round2(data: IntArray): IntArray {
-        val enc = rc4(getKeyBytes(3), data)
-        val mutKey = getKeyBytes(4)
-        val prefKey = getKeyBytes(5)
-        val out = mutableListOf<Int>()
-        for (i in enc.indices) {
-            if (i < 6 && i < prefKey.size) out.add(prefKey[i])
-            var v = enc[i] xor getMutKey(mutKey, i)
-            v = when (i % 10) {
-                0, 8 -> mutC(v)
-                1 -> mutB(v)
-                2, 6 -> mutDollar(v)
-                3 -> mutH(v)
-                4, 9 -> mutS(v)
-                5 -> mutK(v)
-                7 -> mutUnderscore(v)
-                else -> v
-            }
-            out.add(v and 255)
-        }
-        return out.toIntArray()
+        val mut = mutate(data, getKeyBytes(4), getKeyBytes(5), 8, 2)
+        return rc4(getKeyBytes(3), mut)
     }
 
     private fun round3(data: IntArray): IntArray {
-        val enc = rc4(getKeyBytes(6), data)
-        val mutKey = getKeyBytes(7)
-        val prefKey = getKeyBytes(8)
-        val out = mutableListOf<Int>()
-        for (i in enc.indices) {
-            if (i < 7 && i < prefKey.size) out.add(prefKey[i])
-            var v = enc[i] xor getMutKey(mutKey, i)
-            v = when (i % 10) {
-                0 -> mutC(v)
-                1 -> mutF(v)
-                2, 8 -> mutS(v)
-                3 -> mutG(v)
-                4 -> mutY(v)
-                5 -> mutM(v)
-                6 -> mutDollar(v)
-                7 -> mutK(v)
-                9 -> mutB(v)
-                else -> v
-            }
-            out.add(v and 255)
-        }
-        return out.toIntArray()
+        val mut = mutate(data, getKeyBytes(7), getKeyBytes(8), 5, 3)
+        return rc4(getKeyBytes(6), mut)
     }
 
     private fun round4(data: IntArray): IntArray {
-        val enc = rc4(getKeyBytes(9), data)
-        val mutKey = getKeyBytes(10)
-        val prefKey = getKeyBytes(11)
-        val out = mutableListOf<Int>()
-        for (i in enc.indices) {
-            if (i < 8 && i < prefKey.size) out.add(prefKey[i])
-            var v = enc[i] xor getMutKey(mutKey, i)
-            v = when (i % 10) {
-                0 -> mutB(v)
-                1, 9 -> mutM(v)
-                2, 7 -> mutL(v)
-                3, 5 -> mutS(v)
-                4, 6 -> mutUnderscore(v)
-                8 -> mutY(v)
-                else -> v
-            }
-            out.add(v and 255)
-        }
-        return out.toIntArray()
+        val mut = mutate(data, getKeyBytes(10), getKeyBytes(11), 8, 4)
+        return rc4(getKeyBytes(9), mut)
     }
 
     private fun round5(data: IntArray): IntArray {
-        val enc = rc4(getKeyBytes(12), data)
-        val mutKey = getKeyBytes(13)
-        val prefKey = getKeyBytes(14)
-        val out = mutableListOf<Int>()
-        for (i in enc.indices) {
-            if (i < 6 && i < prefKey.size) out.add(prefKey[i])
-            var v = enc[i] xor getMutKey(mutKey, i)
-            v = when (i % 10) {
-                0 -> mutUnderscore(v)
-                1, 7 -> mutS(v)
-                2 -> mutC(v)
-                3, 5 -> mutM(v)
-                4 -> mutB(v)
-                6 -> mutF(v)
-                8 -> mutDollar(v)
-                9 -> mutG(v)
-                else -> v
-            }
-            out.add(v and 255)
-        }
-        return out.toIntArray()
+        val mut = mutate(data, getKeyBytes(13), getKeyBytes(14), 5, 5)
+        return rc4(getKeyBytes(12), mut)
     }
 
-    fun generateHash(path: String, bodySize: Int = 0, time: Long = 1): String {
-        val baseString = "$path:$bodySize:$time"
-        val encoded = URLEncoder.encode(baseString, "UTF-8")
+    fun generateHash(path: String): String {
+        val encoded = URLEncoder.encode(path, "UTF-8")
             .replace("+", "%20")
             .replace("*", "%2A")
             .replace("%7E", "~")
