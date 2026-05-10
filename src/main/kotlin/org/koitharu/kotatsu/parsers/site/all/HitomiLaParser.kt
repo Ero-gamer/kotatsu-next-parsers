@@ -519,10 +519,9 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 						title = doc.selectFirstOrThrow("h1").text(),
 						url = id.toString(),
 						coverUrl =
-							("https:" +
+							"https:" +
 								doc.selectFirstOrThrow("picture > img")
-									.attr("data-src"))
-								.replace(Regex("""webp(?:small(?:small)?|medium)tn/"""), "webpbigtn/"),
+									.attr("data-src"),
 						publicUrl =
 							doc.selectFirstOrThrow("h1 > a")
 								.attrAsRelativeUrl("href")
@@ -726,7 +725,10 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 		)
 
 		var resultHtml = html
-		thumbUrlRegex.findAll(html).forEach { matchResult ->
+		// Also upgrade smallsmalltn urls not matched by the regex above
+		resultHtml = resultHtml.replace("webpsmallsmalltn/", "webpbigtn/")
+		resultHtml = resultHtml.replace("webpsmalltn/", "webpbigtn/")
+		thumbUrlRegex.findAll(resultHtml).forEach { matchResult ->
 			val originalUrl = matchResult.value
 			val groups = matchResult.groups
 
