@@ -23,14 +23,14 @@ JVM and Android applications.
    For Java/Kotlin project:
     ```groovy
     dependencies {
-        implementation("com.github.KotatsuApp:kotatsu-parsers:$parsers_version")
+        implementation("com.github.Ero-gamer:kotatsu-next-parsers:$parsers_version:kotatsu-parsers:$parFors_version")
     }
     ```
 
    For Android project:
     ```groovy
     dependencies {
-        implementation("com.github.KotatsuApp:kotatsu-parsers:$parsers_version") {
+        implementation("com.github.Ero-gamer:kotatsu-next-parsers:$parsers_version") {
             exclude group: 'org.json', module: 'json'
         }
     }
