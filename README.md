@@ -36,7 +36,7 @@ JVM and Android applications.
     }
     ```
 
-   Versions are available on [JitPack](https://jitpack.io/#KotatsuApp/kotatsu-parsers)
+   Versions are available on [JitPack](https://jitpack.io/#Ero-gamer/kotatsu-next-parsers)
 
    When used in Android
    projects, [core library desugaring](https://developer.android.com/studio/write/java8-support#library-desugaring) with
