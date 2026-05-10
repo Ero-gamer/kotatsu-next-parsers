@@ -662,7 +662,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 			MangaPage(
 				id = generateUid(hash),
 				url = "https://a${subDomain}.$cdnDomain/$commonId$imageId/$hash.avif",
-				preview = "https://${thumbSubdomain}tn.$cdnDomain/webpsmallsmalltn/${thumbPathFromHash(hash)}/$hash.webp",
+				preview = "https://${thumbSubdomain}tn.$cdnDomain/webpbigtn/${thumbPathFromHash(hash)}/$hash.webp",
 				source = source,
 			)
 		}
