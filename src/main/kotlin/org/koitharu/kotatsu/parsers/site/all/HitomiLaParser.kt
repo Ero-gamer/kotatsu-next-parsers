@@ -519,9 +519,10 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 						title = doc.selectFirstOrThrow("h1").text(),
 						url = id.toString(),
 						coverUrl =
-							"https:" +
+							("https:" +
 								doc.selectFirstOrThrow("picture > img")
-									.attr("data-src"),
+									.attr("data-src"))
+								.replace(Regex("""webp(?:small(?:small)?|medium)tn/"""), "webpbigtn/"),
 						publicUrl =
 							doc.selectFirstOrThrow("h1 > a")
 								.attrAsRelativeUrl("href")
@@ -680,16 +681,16 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 		if (scriptLastRetrieval == -1L || (scriptLastRetrieval + 60000) < System.currentTimeMillis()) {
 			val ggScript = webClient.httpGet("$ltnBaseUrl/gg.js?_=${System.currentTimeMillis()}").parseRaw()
 
-			subdomainOffsetDefault = Regex("var o = (\\d)").find(ggScript)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-			val o = Regex("o = (\\d); break;").find(ggScript)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+			subdomainOffsetDefault = Regex("var o = (\\d)").find(ggScript)!!.groupValues[1].toInt()
+			val o = Regex("o = (\\d); break;").find(ggScript)!!.groupValues[1].toInt()
 
 			subdomainOffsetMap.clear()
 			Regex("case (\\d+):").findAll(ggScript).forEach {
-				val case = it.groupValues[1].toIntOrNull() ?: return@forEach
+				val case = it.groupValues[1].toInt()
 				subdomainOffsetMap[case] = o
 			}
 
-			commonImageId = Regex("b: '(.+)'").find(ggScript)?.groupValues?.get(1) ?: ""
+			commonImageId = Regex("b: '(.+)'").find(ggScript)!!.groupValues[1]
 
 			scriptLastRetrieval = System.currentTimeMillis()
 		}
@@ -710,7 +711,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	// s <-- gg.js
 	private fun imageIdFromHash(hash: String): Int {
 		val match = Regex("(..)(.)$").find(hash)
-		return match?.groupValues?.let { it[2] + it[1] }?.toIntOrNull(16) ?: 0
+		return match!!.groupValues.let { it[2] + it[1] }.toInt(16)
 	}
 
 	// real_full_path_from_hash <-- common.js
@@ -720,9 +721,8 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 	// rewrite_tn_paths <-- common.js
 	private suspend fun rewriteTnPaths(html: String): String {
-		// Matches any Hitomi/CDN thumbnail URL regardless of prefix combo (avifsmalltn, webpbigtn, webpsmallsmalltn, etc.)
 		val thumbUrlRegex = Regex(
-			"""(?<protocol>//)(?<host>[a-z0-9.-]+\.(?:hitomi\.la|${Regex.escape(cdnDomain)}))/(?<pathAfterHost>[a-z]*tn/[0-9a-f]/[0-9a-f]{2}/[0-9a-f]{64}\.(?:webp|avif|gif|png|jpe?g))""",
+			"""(?<protocol>//)(?<host>[a-z0-9.-]+\.(?:hitomi\.la|${Regex.escape(cdnDomain)}))/(?<pathAfterHost>(?:avif|webp)?(?:small)?(?:big|small|medium)tn/[0-9a-f]/[0-9a-f]{2}/[0-9a-f]{64}\.(?:webp|avif|gif|png|jpe?g))""",
 		)
 
 		var resultHtml = html
@@ -731,9 +731,8 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 			val groups = matchResult.groups
 
 			val pathAfterHost = groups["pathAfterHost"]?.value ?: return@forEach
-			val protocol = groups["protocol"]?.value ?: return@forEach
 			val newTnSubdomain = subdomainFromURL(originalUrl, "tn")
-			val correctedUrl = "$protocol$newTnSubdomain.$cdnDomain/$pathAfterHost"
+			val correctedUrl = "${groups["protocol"]!!.value}$newTnSubdomain.$cdnDomain/$pathAfterHost"
 
 			if (originalUrl != correctedUrl) {
 				resultHtml = resultHtml.replace(originalUrl, correctedUrl)
@@ -745,14 +744,26 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	private suspend fun subdomainFromURL(url: String, base: String?): String {
 		val resultSubdomain = base ?: "b"
 
-		// Extract the full hex hash from the URL path (last path segment before extension)
-		val hashRegex = Regex("""/([0-9a-f]{4,})[./]""")
-		val fullHash = hashRegex.findAll(url).lastOrNull()?.groupValues?.get(1)
-			?: return "a$resultSubdomain"
+		// This regex extracts the last 3 hex characters from the hash in the URL
+		// The hash is 64 characters, so we look for the 61st character onward
+		val hashRegex = Regex("""/([0-9a-f]{61}[0-9a-f]{3})[./]""")
+		val fullHashMatch = hashRegex.find(url)
+			?: // If no hash is found, default to "a" + base (typically "atn")
+			return "a$resultSubdomain"
 
-		val imageId = imageIdFromHash(fullHash)
+		val fullHash = fullHashMatch.groupValues[1]
 
-		return ('a' + subdomainOffset(imageId)).toString() + resultSubdomain
+		val lastThreeChars = fullHash.takeLast(3)
+		val lastDigit = lastThreeChars.last()
+		val lastTwoDigits = lastThreeChars.take(2)
+
+		val imageId = "$lastDigit$lastTwoDigits".toIntOrNull(16)
+
+		return if (imageId != null) {
+			('a' + subdomainOffset(imageId)).toString() + resultSubdomain
+		} else {
+			"a$resultSubdomain"
+		}
 	}
 
 	private fun String.toTagTitle(): String {
