@@ -513,15 +513,22 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 						val html = it.parseRaw()
 						Jsoup.parse(rewriteTnPaths(html), baseUri)
 					}
+					val coverUrl = webClient.httpGet("$ltnBaseUrl/galleries/$id.js")
+						.parseRaw()
+						.substringAfter("var galleryinfo = ")
+						.let(::JSONObject)
+						.getJSONArray("files").getJSONObject(0).let {
+							val hash = it.getString("hash")
+							val imageId = imageIdFromHash(hash)
+							val subDomain = 'a' + subdomainOffset(imageId)
+							"https://${subDomain}tn.$cdnDomain/webpbigtn/${thumbPathFromHash(hash)}/$hash.webp"
+						}
 
 					Manga(
 						id = generateUid(id.toString()),
 						title = doc.selectFirstOrThrow("h1").text(),
 						url = id.toString(),
-						coverUrl =
-							"https:" +
-								doc.selectFirstOrThrow("picture > img")
-									.attr("data-src"),
+						coverUrl = coverUrl,
 						publicUrl =
 							doc.selectFirstOrThrow("h1 > a")
 								.attrAsRelativeUrl("href")
@@ -725,10 +732,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 		)
 
 		var resultHtml = html
-		// Also upgrade smallsmalltn urls not matched by the regex above
-		resultHtml = resultHtml.replace("webpsmallsmalltn/", "webpbigtn/")
-		resultHtml = resultHtml.replace("webpsmalltn/", "webpbigtn/")
-		thumbUrlRegex.findAll(resultHtml).forEach { matchResult ->
+		thumbUrlRegex.findAll(html).forEach { matchResult ->
 			val originalUrl = matchResult.value
 			val groups = matchResult.groups
 
