@@ -267,7 +267,7 @@ internal abstract class MadthemeParser(
 	protected open val selectPage = "div#chapter-images img"
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val fullUrl = chapter.url.toAbsoluteUrl(domain)
+		val fullUrl = chapter.url.normalizedChapterUrl()
 		val doc = webClient.httpGet(fullUrl).parseHtml()
 		val known = HashSet<String>()
 		val result = ArrayList<MangaPage>()
@@ -337,6 +337,19 @@ internal abstract class MadthemeParser(
 			value.startsWith("/") -> "https://$domain$value"
 			else -> value.toAbsoluteUrl(domain)
 		}
+	}
+
+	private fun String.normalizedChapterUrl(): String {
+		val value = trim()
+		if (value.startsWith("https://") || value.startsWith("http://")) {
+			val schemeEnd = value.indexOf("://")
+			val pathStart = value.indexOf('/', startIndex = schemeEnd + 3)
+			if (pathStart == -1) return value
+			val prefix = value.substring(0, pathStart)
+			val path = value.substring(pathStart).replace(Regex("/{2,}"), "/")
+			return prefix + path
+		}
+		return value.toAbsoluteUrl(domain)
 	}
 
 	protected fun parseChapterDate(dateFormat: DateFormat, date: String?): Long {
