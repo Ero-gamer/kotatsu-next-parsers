@@ -1,6 +1,5 @@
 package org.koitharu.kotatsu.parsers.site.en
 
-import java.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import okhttp3.Headers
@@ -10,9 +9,12 @@ import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
-import java.net.URLEncoder
+import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 import java.util.*
 
 @MangaSourceParser("COMIX", "Comix", "en", ContentType.MANGA)
@@ -20,6 +22,12 @@ internal class Comix(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.COMIX, 28) {
 
     override val configKeyDomain = ConfigKey.Domain("comix.to")
+
+    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+        super.onCreateConfig(keys)
+        keys.add(userAgentKey)
+        keys.add(ConfigKey.DisableUpdateChecking(defaultValue = true))
+    }
 
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
@@ -232,13 +240,23 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfterLast("/").substringBefore("-")
-        val path = "/chapters/$chapterId"
-        val chapterUrl = "${apiUrl(path)}?_=${ComixHash.generateHash(path)}"
-        val response = webClient.httpGet(chapterUrl).parseJson()
-        val pages = response.optJSONObject("result")?.optJSONArray("pages") ?: JSONArray()
+        val response = webViewApiJson("/api/v1/chapters/$chapterId")
+        val pagesRoot = response.optJSONObject("result")?.optJSONObject("pages")
+        val baseUrl = pagesRoot?.optString("baseUrl").orEmpty().trimEnd('/')
+        val pages = pagesRoot?.optJSONArray("items")
+            ?: response.optJSONObject("result")?.optJSONArray("pages")
+            ?: JSONArray()
 
         return (0 until pages.length()).map { i ->
-            val imageUrl = pages.getJSONObject(i).getString("url")
+            val rawUrl = when (val item = pages.get(i)) {
+                is JSONObject -> item.getString("url")
+                else -> item.toString()
+            }
+            val imageUrl = if (rawUrl.startsWith("http", ignoreCase = true) || baseUrl.isBlank()) {
+                rawUrl
+            } else {
+                "$baseUrl/${rawUrl.trimStart('/')}"
+            }
             MangaPage(
                 id = generateUid("$chapterId-$i"),
                 url = imageUrl,
@@ -250,94 +268,414 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        val allChapters = mutableListOf<JSONObject>()
-        var page = 1
-
-        // Fetch all chapters with pagination
-        while (true) {
-            val chaptersPath = "/manga/$hashId/chapters"
-            val hashToken = ComixHash.generateHash(chaptersPath)
-            val chaptersUrl = "${apiUrl(chaptersPath)}?order[number]=desc&limit=100&page=$page&_=$hashToken"
-            val response = webClient.httpGet(chaptersUrl).parseJson()
-            val result = response.getJSONObject("result")
-            val items = result.getJSONArray("items")
-
-            if (items.length() == 0) break
-
-            for (i in 0 until items.length()) {
-                allChapters.add(items.getJSONObject(i))
+        val allChapters = webViewChapterList(hashId)
+        val allChapterObjects = (0 until allChapters.length()).map { allChapters.getJSONObject(it) }
+        val chaptersBuilder = ChaptersListBuilder(allChapterObjects.size)
+        for (chapterData in allChapterObjects) {
+            val chapterId = chapterData.getLong("id")
+            val number = chapterData.getDouble("number").toFloat()
+            val name = chapterData.optString("name", "").nullIfEmpty()
+            val scanlationGroup = chapterData.optJSONObject("group") ?: chapterData.optJSONObject("scanlation_group")
+            val scanlator = scanlationGroup?.optString("name", null)
+                ?: if (chapterData.optBoolean("isOfficial")) "Official" else "Unknown"
+            val title = if (name != null) {
+                "Chapter $number: $name"
+            } else {
+                "Chapter $number"
             }
-
-            // Check pagination info to see if we have more pages
-            val pagination = result.optJSONObject("pagination") ?: result.optJSONObject("meta")
-            val currentPage = pagination?.optIntOrNull("page")
-                ?: pagination?.optIntOrNull("current_page")
-                ?: page
-            val lastPage = pagination?.optIntOrNull("lastPage")
-                ?: pagination?.optIntOrNull("last_page")
-                ?: 1
-            if (currentPage >= lastPage) break
-
-            page++
-        }
-
-        // Group chapters by scanlation team
-        val chaptersByTeam = mutableMapOf<String, MutableList<JSONObject>>()
-        for (chapter in allChapters) {
-            val scanlationGroup = chapter.optJSONObject("group") ?: chapter.optJSONObject("scanlation_group")
-            val teamName = scanlationGroup?.optString("name", null) ?: "Unknown"
-            chaptersByTeam.getOrPut(teamName) { mutableListOf() }.add(chapter)
-        }
-
-        // Get all unique chapter numbers
-        val allChapterNumbers = allChapters.map { it.getDouble("number").toFloat() }.toSet()
-
-        // Build chapters with branches - each team gets complete chapter list with gaps filled
-        val chaptersBuilder = ChaptersListBuilder(allChapters.size * chaptersByTeam.size)
-
-        for ((teamName, teamChapters) in chaptersByTeam) {
-            // Map of chapter numbers this team has
-            val teamChapterMap = teamChapters.associateBy { it.getDouble("number").toFloat() }
-
-            // For each chapter number, use team's version if available, otherwise find best alternative
-            for (chapterNumber in allChapterNumbers) {
-                val chapterData = teamChapterMap[chapterNumber]
-                    ?: allChapters.find { it.getDouble("number").toFloat() == chapterNumber }
-                    ?: continue
-
-                val chapterId = chapterData.getLong("id")
-                val number = chapterData.getDouble("number").toFloat()
-                val name = chapterData.optString("name", "").nullIfEmpty()
-                val scanlationGroup = chapterData.optJSONObject("group") ?: chapterData.optJSONObject("scanlation_group")
-                val actualTeamName = scanlationGroup?.optString("name", null)
-                    ?: if (chapterData.optBoolean("isOfficial")) "Official" else "Unknown"
-
-                val title = if (name != null) {
-                    "Chapter $number: $name"
-                } else {
-                    "Chapter $number"
-                }
-
-                val chapter = MangaChapter(
-                    id = generateUid("$teamName-$chapterId"),
+            chaptersBuilder.add(
+                MangaChapter(
+                    id = generateUid("$scanlator-$chapterId"),
                     title = title,
                     number = number,
                     volume = 0,
-                    url = "/title/$hashId/$chapterId-chapter-${number.toInt()}",
+                    url = "/title/$hashId/$chapterId-chapter-${number.toChapterUrlPart()}",
                     uploadDate = parseRelativeDate(chapterData.optString("createdAtFormatted")),
                     source = source,
-                    scanlator = actualTeamName,
-                    branch = teamName,
-                )
-
-                chaptersBuilder.add(chapter)
-            }
+                    scanlator = scanlator,
+                    branch = scanlator,
+                ),
+            )
         }
 
         return chaptersBuilder.toList().reversed()
     }
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
+
+    private suspend fun webViewApiJson(apiPath: String): JSONObject {
+        logDebug("webViewApiJson start path=$apiPath")
+        return evaluateWebViewJson(
+            label = apiPath,
+            script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
+        )
+    }
+
+    private suspend fun webViewChapterList(hashId: String): JSONArray {
+        val pathPrefix = "/api/v1/manga/$hashId/chapters?page="
+        logDebug("webViewChapterList start hashId=$hashId prefix=$pathPrefix")
+        val json = evaluateWebViewJson(
+            label = "chapters:$hashId",
+            script = buildWebViewApiScript(
+                """
+                    const all = [];
+                    const compact = (item) => ({
+                        id: item.id,
+                        number: item.number,
+                        name: item.name || "",
+                        createdAtFormatted: item.createdAtFormatted || "",
+                        isOfficial: !!item.isOfficial,
+                        group: item.group || item.scanlation_group || null
+                    });
+                    const mostActiveGroupId = (items) => {
+                        const counts = new Map();
+                        for (const item of items) {
+                            const group = item.group || item.scanlation_group;
+                            const id = group && group.id;
+                            if (id === undefined || id === null) continue;
+                            counts.set(String(id), (counts.get(String(id)) || 0) + 1);
+                        }
+                        let best = "";
+                        let bestCount = 0;
+                        for (const [id, count] of counts) {
+                            if (count > bestCount) {
+                                best = id;
+                                bestCount = count;
+                            }
+                        }
+                        return best;
+                    };
+                    const pagePath = (page, groupId) =>
+                        ${pathPrefix.toJsString()} + page +
+                            "&limit=$CHAPTER_API_LIMIT&order%5Bnumber%5D=desc" +
+                            (groupId ? "&group_id=" + encodeURIComponent(groupId) : "");
+
+                    const appendItems = (items) => {
+                        for (const item of items) all.push(compact(item));
+                    };
+                    const pageInfo = (result, fallbackPage) => {
+                        const pagination = (result && (result.pagination || result.meta)) || {};
+                        return {
+                            current: Number(pagination.page || pagination.current_page || fallbackPage),
+                            last: Number(pagination.lastPage || pagination.last_page || 1)
+                        };
+                    };
+
+                    const firstRoot = await fetchProtected(pagePath(1, ""));
+                    const firstResult = firstRoot && firstRoot.result ? firstRoot.result : firstRoot;
+                    if (!firstResult || !Array.isArray(firstResult.items)) {
+                        const keys = firstResult && typeof firstResult === "object" ? Object.keys(firstResult).join(",") : typeof firstResult;
+                        throw new Error("chapter payload has no items; keys=" + keys);
+                    }
+                    const firstItems = firstResult.items;
+                    if (!firstItems.length) {
+                        return JSON.stringify({ items: [], debug: { pages: 1, count: 0, groupId: "", firstPageCount: 0 } });
+                    }
+
+                    const groupId = mostActiveGroupId(firstItems);
+                    const firstPagination = pageInfo(firstResult, 1);
+                    let page = 1;
+                    if (!groupId) {
+                        appendItems(firstItems);
+                        page = firstPagination.current >= firstPagination.last ? $MAX_CHAPTER_API_PAGES + 1 : 2;
+                    }
+                    while (page <= $MAX_CHAPTER_API_PAGES) {
+                        const root = await fetchProtected(pagePath(page, groupId));
+                        const result = root && root.result ? root.result : root;
+                        if (!result || !Array.isArray(result.items)) {
+                            const keys = result && typeof result === "object" ? Object.keys(result).join(",") : typeof result;
+                            throw new Error("chapter payload has no items; keys=" + keys);
+                        }
+                        const items = result.items;
+                        appendItems(items);
+                        const pagination = pageInfo(result, page);
+                        if (!items.length || pagination.current >= pagination.last) break;
+                        page++;
+                    }
+                    return JSON.stringify({ items: all, debug: { pages: page, count: all.length, groupId, firstPageCount: firstItems.length } });
+                """.trimIndent(),
+            ),
+        )
+        val items = json.optJSONArray("items") ?: JSONArray()
+        logDebug("webViewChapterList done hashId=$hashId count=${items.length()} debug=${json.optJSONObject("debug")}")
+        return items
+    }
+
+    private suspend fun evaluateWebViewJson(label: String, script: String): JSONObject {
+        val bridgeScript = buildBridgeScript(script)
+        logDebug("evaluateWebViewJson intercept base=https://$domain/ label=$label scriptLen=${bridgeScript.length}")
+        val requests = runCatching {
+            context.interceptWebViewRequests(
+                "https://$domain/",
+                InterceptionConfig(
+                    timeoutMs = WEBVIEW_API_TIMEOUT,
+                    maxRequests = 1,
+                    urlPattern = INTERCEPT_URL_REGEX,
+                    pageScript = bridgeScript,
+                ),
+            )
+        }.getOrElse { e ->
+            throw ParseException("Comix WebView API interception failed", "https://$domain/", e)
+        }
+        val resultUrl = requests.firstOrNull()?.url
+            ?: throw ParseException("Comix WebView API did not return a bridge result", "https://$domain/")
+        logDebug("evaluateWebViewJson bridge label=$label url=${resultUrl.take(LOG_EXCERPT)}")
+        val decoded = when {
+            resultUrl.contains("/error?", ignoreCase = true) -> {
+                val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
+                throw ParseException("Comix WebView API failed: $message", "https://$domain/")
+            }
+            else -> resultUrl.queryParameterValue("data")
+                ?: throw ParseException("Comix WebView API bridge result missing data", "https://$domain/")
+        }
+        logDebug("evaluateWebViewJson decoded label=$label len=${decoded.length} excerpt=${decoded.take(LOG_EXCERPT)}")
+        if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
+            logDebug("evaluateWebViewJson cloudflare label=$label")
+            requestCloudflareVerification("https://$domain/")
+        }
+        if (decoded.isBlank()) {
+            logDebug("evaluateWebViewJson blank label=$label")
+            throw ParseException("Comix WebView API returned an empty response", "https://$domain/")
+        }
+        val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
+            logDebug("evaluateWebViewJson invalid json label=$label")
+            throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", "https://$domain/", e)
+        }
+        logDebug("evaluateWebViewJson json label=$label keys=${json.keys().asSequence().joinToString(",")}")
+        json.optString("error").nullIfEmpty()?.let { error ->
+            logDebug("evaluateWebViewJson error label=$label error=$error")
+            throw ParseException("Comix WebView API failed: $error", "https://$domain/")
+        }
+        return json
+    }
+
+    private fun buildBridgeScript(script: String): String {
+        return """
+            (async function() {
+                try {
+                    const result = await $script;
+                    window.location.href = "$INTERCEPT_RESULT_URL#data=" + encodeURIComponent(String(result || ""));
+                } catch (e) {
+                    window.location.href = "$INTERCEPT_ERROR_URL#msg=" + encodeURIComponent(String((e && e.message) || e));
+                }
+            })();
+        """.trimIndent()
+    }
+
+    private fun requestCloudflareVerification(url: String, cause: Throwable? = null): Nothing {
+        try {
+            context.requestBrowserAction(this, url)
+        } catch (e: UnsupportedOperationException) {
+            throw ParseException(CLOUDFLARE_MESSAGE, url, cause ?: e)
+        }
+    }
+
+    private fun buildWebViewApiScript(body: String): String {
+        return """
+            (async () => {
+                const probePath = "/manga/g2rk/chapters";
+                const tokenRegex = /^[A-Za-z0-9_-]{40,200}$/;
+                const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+                const challengeDetected = () => {
+                    const root = document.documentElement;
+                    const html = (root && root.outerHTML) || "";
+                    const text = ((document.body && document.body.innerText) || (root && root.innerText) || "");
+                    const lower = (document.title + "\n" + text + "\n" + html).toLowerCase();
+                    return document.querySelector('script[src*="challenge-platform"]') !== null ||
+                        document.querySelector('script[src*="turnstile"]') !== null ||
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null ||
+                        document.querySelector('.cf-turnstile') !== null ||
+                        document.querySelector('form[action*="__cf_chl"]') !== null ||
+                        document.querySelector('.cf-browser-verification') !== null ||
+                        ((lower.includes('just a moment') || lower.includes('checking your browser')) && lower.includes('cloudflare')) ||
+                        lower.includes('challenge-platform') ||
+                        lower.includes('challenges.cloudflare.com') ||
+                        lower.includes('cf-turnstile') ||
+                        lower.includes('turnstile') ||
+                        lower.includes('cf-chl-opt');
+                };
+                const findGlue = () => {
+                    let signer = null;
+                    let installer = null;
+                    let responseHandler = null;
+                    const keys = Object.keys(window);
+                    for (let i = 0; i < keys.length; i++) {
+                        const topName = keys[i];
+                        if (!/^vm[A-Za-z]_\w+${'$'}/.test(topName)) continue;
+                        const ns = window[topName];
+                        if (!ns || typeof ns !== "object") continue;
+                        const fnames = Object.keys(ns);
+                        for (let j = 0; j < fnames.length; j++) {
+                            const fn = ns[fnames[j]];
+                            if (typeof fn !== "function") continue;
+                            if (!signer) {
+                                try {
+                                    const out = fn(probePath);
+                                    if (typeof out === "string" && out !== probePath && tokenRegex.test(out)) {
+                                        signer = fn;
+                                    }
+                                } catch (e) {}
+                            }
+                            if (!installer) {
+                                try {
+                                    let got = false;
+                                    let resFn = null;
+                                    const fakeAxios = {
+                                        interceptors: {
+                                            request: { use: function() {} },
+                                            response: { use: function(fn) { got = true; resFn = fn; } }
+                                        },
+                                        defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
+                                    };
+                                    fn(fakeAxios);
+                                    if (got) {
+                                        installer = fn;
+                                        responseHandler = resFn;
+                                    }
+                                } catch (e) {}
+                            }
+                            if (signer && installer) return { signer, installer, responseHandler };
+                        }
+                    }
+                    return null;
+                };
+
+                try {
+                    let glue = null;
+                    for (let attempt = 0; attempt < 80; attempt++) {
+                        if (challengeDetected()) return "$CLOUDFLARE_BLOCKED";
+                        glue = findGlue();
+                        if (glue) break;
+                        await sleep(250);
+                    }
+                    if (!glue) throw new Error("signer/decryptor not detected");
+
+                    const captured = { res: glue.responseHandler || null };
+                    if (!captured.res) {
+                        const fakeAxios = {
+                            interceptors: {
+                                request: { use: function() {} },
+                                response: { use: function(fn) { captured.res = fn; } }
+                            },
+                            defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
+                        };
+                        glue.installer(fakeAxios);
+                    }
+
+                    const signCandidates = (apiPath) => {
+                        const withoutApi = apiPath.replace(/^\/api\/v1/, "");
+                        const withoutQuery = withoutApi.split("?")[0];
+                        const decoded = (() => {
+                            try { return decodeURIComponent(withoutApi); } catch (e) { return withoutApi; }
+                        })();
+                        return [...new Set([withoutApi, decoded, withoutQuery])];
+                    };
+
+                    const fetchProtected = async (apiPath) => {
+                        const sep = apiPath.indexOf("?") === -1 ? "?" : "&";
+                        let resp = null;
+                        let text = "";
+                        let signedUrl = "";
+                        let lastError = "";
+                        for (const signablePath of signCandidates(apiPath)) {
+                            const sig = glue.signer(signablePath);
+                            if (!sig) {
+                                lastError = "signer returned empty token";
+                                continue;
+                            }
+                            signedUrl = apiPath + sep + "_=" + encodeURIComponent(sig);
+                            resp = await fetch(signedUrl, {
+                                credentials: "include",
+                                headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
+                            });
+                            text = await resp.text();
+                            if (resp.status >= 200 && resp.status < 300) break;
+                            lastError = "HTTP " + resp.status + " signed=" + signablePath + ": " + text.slice(0, 200);
+                            if (resp.status !== 422) break;
+                        }
+                        if (!resp) throw new Error(lastError || "request was not sent");
+                        if (resp.status < 200 || resp.status >= 300) {
+                            throw new Error(lastError || ("HTTP " + resp.status + ": " + text.slice(0, 200)));
+                        }
+                        const raw = JSON.parse(text);
+                        if (raw && typeof raw === "object" && "e" in raw && captured.res) {
+                            const fakeResp = {
+                                data: raw,
+                                status: resp.status,
+                                statusText: resp.statusText,
+                                headers: Object.fromEntries([...resp.headers.entries()]),
+                                config: { url: signedUrl, method: "get", baseURL: "/api/v1" },
+                                request: {}
+                            };
+                            const decoded = await captured.res(fakeResp);
+                            return { result: decoded && decoded.data };
+                        }
+                        if (raw && typeof raw === "object" && "e" in raw) {
+                            throw new Error("encrypted response received but decryptor was not captured");
+                        }
+                        if (raw && typeof raw === "object" && "result" in raw) return raw;
+                        return { result: raw };
+                    };
+
+                    $body
+                } catch (e) {
+                    return JSON.stringify({ error: String((e && e.message) || e) });
+                }
+            })();
+        """.trimIndent()
+    }
+
+    private fun String.queryParameterValue(name: String): String? {
+        val query = substringAfter('#', substringAfter('?', ""))
+        if (query.isEmpty()) return null
+        return query.split('&')
+            .asSequence()
+            .map { it.split('=', limit = 2) }
+            .firstOrNull { it.size == 2 && it[0] == name }
+            ?.get(1)
+            ?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) }
+    }
+
+    private fun String.toJsString(): String {
+        return "\"" + replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t") + "\""
+    }
+
+    private fun String.decodeWebViewString(): String {
+        if (length < 2 || first() != '"' || last() != '"') {
+            return this
+        }
+        return substring(1, lastIndex)
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+            .replace("\\/", "/")
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace(UNICODE_ESCAPE_REGEX) { match ->
+                match.groupValues[1].toInt(16).toChar().toString()
+            }
+    }
+
+    private fun isCloudflarePage(html: String): Boolean {
+        if (html.isBlank()) return false
+        val lower = html.lowercase(Locale.US)
+        return lower.contains("<title>just a moment") ||
+            ((lower.contains("just a moment") || lower.contains("checking your browser")) && lower.contains("cloudflare")) ||
+            lower.contains("cf-browser-verification") ||
+            lower.contains("cf-chl-opt") ||
+            lower.contains("challenge-platform") ||
+            lower.contains("challenges.cloudflare.com") ||
+            lower.contains("cf-turnstile") ||
+            lower.contains("turnstile")
+    }
+
+    private fun logDebug(message: String) {
+        println("COMIX_DEBUG: $message")
+    }
 
     private fun parseTerms(json: JSONObject): Set<MangaTag> {
         val tags = LinkedHashSet<MangaTag>()
@@ -391,187 +729,27 @@ internal class Comix(context: MangaLoaderContext) :
         return if (has(key) && !isNull(key)) optInt(key) else null
     }
 
+    private fun Float.toChapterUrlPart(): String {
+        return if (this % 1f == 0f) {
+            toInt().toString()
+        } else {
+            toString().trimEnd('0').trimEnd('.')
+        }
+    }
+
     private companion object {
         private val NSFW_RATINGS = setOf("erotica", "pornographic")
         private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
-    }
-}
-
-private object ComixHash {
-    private val KEYS = arrayOf(
-        "JxTcdyiA5GZxnbrmthXBQfU2IMTKcY1+3nNhbq98Sgo=",
-        "3PordjODbhqla382Cxapmo/1JiABJQcjiJj1+48gTJ4=",
-        "OaKvnI5ARA==",
-        "MHNBHYWA7lvy867fXgvGcJwWDk79KqUJUVFsh3RwnnI=",
-        "8i0Cru/VJBSVB2Y1GcMDVpzx2WepOcfnWdd81yxICl4=",
-        "Fyskubz8VvA=",
-        "B46L1x+UeWP+19cRpQ+OZvdLAK9EHID8g3mSgn57tew=",
-        "DTSTmUt6LpDUw9r1lSQqyb3YlFTzruT8tk8wUGkwehQ=",
-        "vY/meeI=",
-        "7xWfIF5THL5LAnRgAARg+4mjWHPU9n3PQwvzbaMNi+Q=",
-        "bewtiTuV+HJk56xxkf2iCljLgruCpBmN9BgE8i6gc9M=",
-        "/Xcb2zAu8AU=",
-        "WgeCQ3T8R51uTwVSiVa7Zy0dN6JOg6Z5JleMS+HV8Aw=",
-        "yXayUVFrrcW56jQCEfZzuCidjpnWKjTDUNT7XeX9i7k=",
-        "tSLco2w=",
-    )
-
-    private fun getKeyBytes(index: Int): IntArray {
-        val b64 = KEYS.getOrNull(index) ?: return IntArray(0)
-        return try {
-            Base64.getDecoder().decode(b64)
-                .map { (it.toInt() and 0xFF) }
-                .toIntArray()
-        } catch (_: Exception) {
-            IntArray(0)
-        }
-    }
-
-    private fun rc4(key: IntArray, data: IntArray): IntArray {
-        if (key.isEmpty()) return data
-        val s = IntArray(256) { it }
-        var j = 0
-        for (i in 0 until 256) {
-            j = (j + s[i] + key[i % key.size]) % 256
-            val temp = s[i]
-            s[i] = s[j]
-            s[j] = temp
-        }
-        var i = 0
-        j = 0
-        val out = IntArray(data.size)
-        for (k in data.indices) {
-            i = (i + 1) % 256
-            j = (j + s[i]) % 256
-            val temp = s[i]
-            s[i] = s[j]
-            s[j] = temp
-            out[k] = data[k] xor s[(s[i] + s[j]) % 256]
-        }
-        return out
-    }
-
-    private fun getMutKey(mk: IntArray, idx: Int): Int =
-        if (mk.isNotEmpty() && (idx % 32) < mk.size) mk[idx % 32] else 0
-
-    private fun opShiftRight7Left1(e: Int): Int = ((e ushr 7) or (e shl 1)) and 255
-    private fun opShiftLeft1Right7(e: Int): Int = ((e shl 1) or (e ushr 7)) and 255
-    private fun opShiftRight2Left6(e: Int): Int = ((e ushr 2) or (e shl 6)) and 255
-    private fun opShiftLeft4Right4(e: Int): Int = ((e shl 4) or (e ushr 4)) and 255
-    private fun opShiftRight4Left4(e: Int): Int = ((e ushr 4) or (e shl 4)) and 255
-
-    private fun mutate(data: IntArray, mutKey: IntArray, prefKey: IntArray, prefKeyLimit: Int, round: Int): IntArray {
-        val out = mutableListOf<Int>()
-        for (i in data.indices) {
-            if (i < prefKeyLimit && i < prefKey.size) out.add(prefKey[i])
-            var v = data[i] xor getMutKey(mutKey, i)
-            v = when (round) {
-                1 -> when (i % 10) {
-                    0 -> opShiftRight7Left1(v)
-                    1 -> v xor 37
-                    2 -> v xor 81
-                    3 -> v xor 147
-                    4 -> opShiftRight2Left6(v)
-                    5, 8 -> opShiftRight4Left4(v)
-                    6 -> v xor 218
-                    7 -> (v + 159) and 255
-                    9 -> v xor 180
-                    else -> v
-                }
-                2 -> when (i % 10) {
-                    0, 9 -> v xor 180
-                    1 -> opShiftLeft1Right7(v)
-                    2 -> v xor 147
-                    3 -> opShiftRight7Left1(v)
-                    4 -> opShiftRight2Left6(v)
-                    5 -> opShiftRight4Left4(v)
-                    6, 8 -> (v + 159) and 255
-                    7 -> (v + 34) and 255
-                    else -> v
-                }
-                3 -> when (i % 10) {
-                    0 -> v xor 81
-                    1 -> opShiftRight4Left4(v)
-                    2, 9 -> opShiftLeft4Right4(v)
-                    3 -> v xor 37
-                    4 -> (v + 159) and 255
-                    5 -> opShiftLeft1Right7(v)
-                    6 -> v xor 180
-                    7 -> (v + 34) and 255
-                    8 -> opShiftRight2Left6(v)
-                    else -> v
-                }
-                4 -> when (i % 10) {
-                    0, 7 -> v xor 218
-                    1, 4 -> opShiftLeft1Right7(v)
-                    2 -> opShiftRight7Left1(v)
-                    3 -> (v + 159) and 255
-                    5, 8 -> v xor 180
-                    6 -> v xor 147
-                    9 -> v xor 37
-                    else -> v
-                }
-                5 -> when (i % 10) {
-                    0 -> opShiftLeft4Right4(v)
-                    1, 3 -> v xor 147
-                    2 -> (v + 34) and 255
-                    4, 9 -> v xor 218
-                    5, 7 -> opShiftLeft1Right7(v)
-                    6 -> v xor 180
-                    8 -> opShiftRight2Left6(v)
-                    else -> v
-                }
-                else -> v
-            }
-            out.add(v and 255)
-        }
-        return out.toIntArray()
-    }
-
-    private fun round1(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(1), getKeyBytes(2), 7, 1)
-        return rc4(getKeyBytes(0), mut)
-    }
-
-    private fun round2(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(4), getKeyBytes(5), 8, 2)
-        return rc4(getKeyBytes(3), mut)
-    }
-
-    private fun round3(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(7), getKeyBytes(8), 5, 3)
-        return rc4(getKeyBytes(6), mut)
-    }
-
-    private fun round4(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(10), getKeyBytes(11), 8, 4)
-        return rc4(getKeyBytes(9), mut)
-    }
-
-    private fun round5(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(13), getKeyBytes(14), 5, 5)
-        return rc4(getKeyBytes(12), mut)
-    }
-
-    fun generateHash(path: String): String {
-        val encoded = URLEncoder.encode(path, "UTF-8")
-            .replace("+", "%20")
-            .replace("*", "%2A")
-            .replace("%7E", "~")
-
-        val initialBytes = encoded.toByteArray(Charsets.US_ASCII)
-            .map { it.toInt() and 0xFF }
-            .toIntArray()
-
-        val r1 = round1(initialBytes)
-        val r2 = round2(r1)
-        val r3 = round3(r2)
-        val r4 = round4(r3)
-        val r5 = round5(r4)
-
-        val finalBytes = ByteArray(r5.size) { r5[it].toByte() }
-
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(finalBytes)
+        private val UNICODE_ESCAPE_REGEX = Regex("""\\u([0-9A-Fa-f]{4})""")
+        private const val WEBVIEW_API_TIMEOUT = 90000L
+        private const val CHAPTER_API_LIMIT = 100
+        private const val MAX_CHAPTER_API_PAGES = 30
+        private const val LOG_EXCERPT = 500
+        private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
+        private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
+        private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
+        private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
+        private const val CLOUDFLARE_MESSAGE = "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
     }
 }

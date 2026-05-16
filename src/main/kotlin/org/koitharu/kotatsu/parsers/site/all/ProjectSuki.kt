@@ -108,8 +108,8 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 
 	private fun parseBookList(document: Document): List<Manga> {
 		val result = LinkedHashMap<String, Manga>()
-		document.select("div.browse:has(a[href])").forEach { container ->
-			val titleAnchor = container.select(".details h4 a[href], h4 a[href]")
+		document.select("div.browse:has(a[href]), div.item:has(a[href])").forEach { container ->
+			val titleAnchor = container.select(".details h4 a[href], h4 a[href], .details a[itemprop=title][href], a[itemprop=title][href]")
 				.firstOrNull { it.absUrl("href").toBookId() != null && it.text().isValidBookTitle(it.absUrl("href").toBookId().orEmpty()) }
 			val bookId = titleAnchor?.absUrl("href")?.toBookId()
 				?: container.select("a[href]").firstNotNullOfOrNull { it.absUrl("href").toBookId() }
@@ -126,7 +126,7 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 
 	private fun parseBookSummary(bookId: String, container: Element, anchor: Element): Manga {
 		val title = sequenceOf(
-			container.select(".details h4 a[href], h4 a[href]")
+			container.select(".details h4 a[href], h4 a[href], .details a[itemprop=title][href], a[itemprop=title][href]")
 				.firstOrNull { it.absUrl("href").toBookId() == bookId }
 				?.text(),
 			container.select("h1, h2, h3, h4, .title, [itemprop=name]").firstOrNull()?.text(),
