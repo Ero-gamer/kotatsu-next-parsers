@@ -513,22 +513,15 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 						val html = it.parseRaw()
 						Jsoup.parse(rewriteTnPaths(html), baseUri)
 					}
-					val coverUrl = webClient.httpGet("$ltnBaseUrl/galleries/$id.js")
-						.parseRaw()
-						.substringAfter("var galleryinfo = ")
-						.let(::JSONObject)
-						.getJSONArray("files").getJSONObject(0).let {
-							val hash = it.getString("hash")
-							val imageId = imageIdFromHash(hash)
-							val subDomain = 'a' + subdomainOffset(imageId)
-							"https://${subDomain}tn.$cdnDomain/webpbigtn/${thumbPathFromHash(hash)}/$hash.webp"
-						}
 
 					Manga(
 						id = generateUid(id.toString()),
 						title = doc.selectFirstOrThrow("h1").text(),
 						url = id.toString(),
-						coverUrl = coverUrl,
+						coverUrl =
+							"https:" +
+								doc.selectFirstOrThrow("picture > img")
+									.attr("data-src"),
 						publicUrl =
 							doc.selectFirstOrThrow("h1 > a")
 								.attrAsRelativeUrl("href")
