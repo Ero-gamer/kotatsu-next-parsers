@@ -553,7 +553,7 @@ internal class TomiloLib(context: MangaLoaderContext) :
 	}
 
 	private fun HttpUrl.toFallbackCoverImageUrl(responseCode: Int): HttpUrl? {
-		if (responseCode != 404) {
+		if (responseCode != 403 && responseCode != 404) {
 			return null
 		}
 		val titleId = when {
