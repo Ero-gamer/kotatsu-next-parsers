@@ -45,6 +45,11 @@ internal class Kagane(context: MangaLoaderContext) :
         SortOrder.ALPHABETICAL
     )
 
+    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+        super.onCreateConfig(keys)
+        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+    }
+
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
             isSearchSupported = true,
@@ -285,15 +290,24 @@ internal class Kagane(context: MangaLoaderContext) :
                     .ifBlank { ch.optString("bookId") }
                 if (chId.isBlank()) continue
                 val chapterNo = ch.optString("chapter_no")
-                val number = ch.optDouble("sort_no", Double.NaN).takeIf { !it.isNaN() }?.toFloat()
+                val chapterNumber = chapterNo.toChapterNumberOrNull()
+                    ?: ch.optDouble("number", Double.NaN).takeIf { !it.isNaN() }?.toFloat()
+                val sortNumber = ch.optDouble("sort_no", Double.NaN).takeIf { !it.isNaN() }?.toFloat()
                     ?: ch.optDouble("number_sort", ch.optDouble("numberSort", Double.NaN)).takeIf { !it.isNaN() }?.toFloat()
-                    ?: chapterNo.toFloatOrNull()
-                    ?: ch.optDouble("number", 0.0).toFloat()
+                val number = when {
+                    sortNumber != null && chapterNumber != null && sortNumber >= chapterNumber -> sortNumber
+                    sortNumber != null && chapterNumber == null -> sortNumber
+                    chapterNumber != null -> chapterNumber
+                    else -> 0f
+                }
                 val chTitle = ch.optString("title")
                     .ifBlank { ch.optString("name") }
                     .ifBlank { chapterNo.takeIf { it.isNotBlank() }?.let { "Chapter $it" }.orEmpty() }
                     .ifBlank { "Chapter $number" }
                 val pageCount = ch.optInt("page_count", ch.optInt("pages_count", ch.optInt("pagesCount", 0)))
+                val volume = ch.optString("volume_no")
+                    .ifBlank { ch.optString("volume") }
+                    .toIntOrNull() ?: 0
                 val dateStr = ch.optString("published_on")
                     .ifBlank { ch.optString("release_date") }
                     .ifBlank { ch.optString("releaseDate") }
@@ -304,7 +318,7 @@ internal class Kagane(context: MangaLoaderContext) :
                         id = generateUid("$seriesId:$chId"),
                         title = chTitle,
                         number = number,
-                        volume = 0,
+                        volume = volume,
                         url = "/series/$seriesId/$chId?pages=$pageCount",
                         uploadDate = try { dateFormat.parse(dateStr)?.time ?: 0L } catch (_: Exception) { 0L },
                         source = source,
@@ -313,7 +327,12 @@ internal class Kagane(context: MangaLoaderContext) :
                     ),
                 )
             }
-            return chapters
+            return chapters.sortedWith(
+                compareBy<MangaChapter> { it.number <= 0f }
+                    .thenBy { it.number }
+                    .thenBy { it.volume }
+                    .thenBy { it.title.orEmpty() },
+            )
         }
 
         var chapters = parseChapters(
@@ -362,8 +381,8 @@ internal class Kagane(context: MangaLoaderContext) :
             ?.substringAfter("=")
             ?.toIntOrNull() ?: 0
 
-        // 1. Fetch certificate (Widevine)
-        val cert = getCertificate()
+        // 1. Fetch optional Widevine server certificate
+        val cert = getCertificate().orEmpty()
 
         // 2. Generate PSSH
         val pssh = getPssh(chapterId)
@@ -374,13 +393,6 @@ internal class Kagane(context: MangaLoaderContext) :
                 try {
                     const certBase64 = "$cert";
                     const psshBase64 = "$pssh";
-                    const binaryString = atob(certBase64);
-                    const bytes = new Uint8Array(binaryString.length);
-                    for (var i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-                    const serverCert = bytes.buffer;
-
                     const config = [{
                         initDataTypes: ["cenc"],
                         audioCapabilities: [],
@@ -395,7 +407,18 @@ internal class Kagane(context: MangaLoaderContext) :
                     }
 
                     const mediaKeys = await access.createMediaKeys();
-                    await mediaKeys.setServerCertificate(serverCert);
+                    if (certBase64) {
+                        try {
+                            const binaryString = atob(certBase64);
+                            const bytes = new Uint8Array(binaryString.length);
+                            for (var i = 0; i < binaryString.length; i++) {
+                                bytes[i] = binaryString.charCodeAt(i);
+                            }
+                            if (bytes.length > 0) {
+                                await mediaKeys.setServerCertificate(bytes.buffer);
+                            }
+                        } catch (e) {}
+                    }
 
                     const session = mediaKeys.createSession();
 
@@ -548,19 +571,25 @@ internal class Kagane(context: MangaLoaderContext) :
     }
 
     private var cachedCert: String? = null
+    private var certificateFetchAttempted = false
     private var integrityToken: String = ""
     private var integrityTokenExp: Long = 0L
 
-    private suspend fun getCertificate(): String {
+    private suspend fun getCertificate(): String? {
         cachedCert?.let { return it }
+        if (certificateFetchAttempted) return null
+        certificateFetchAttempted = true
         val url = "$apiUrl/api/v2/static/bin.bin"
         val req = Request.Builder().url(url)
             .addHeader("Origin", "https://$domain")
             .addHeader("Referer", "https://$domain/")
             .build()
 
-        val bytes = context.httpClient.newCall(req).await().body?.bytes()
-            ?: throw Exception("Failed to fetch certificate")
+        val response = runCatching {
+            context.httpClient.newCall(req).await()
+        }.getOrNull() ?: return null
+        if (!response.isSuccessful) return null
+        val bytes = response.body?.bytes()?.takeIf { it.isNotEmpty() } ?: return null
 
         val b64 = Base64.getEncoder().encodeToString(bytes)
         cachedCert = b64
@@ -612,6 +641,10 @@ internal class Kagane(context: MangaLoaderContext) :
         val fullBox = outerSize + psshTag + innerBox
         return Base64.getEncoder().encodeToString(fullBox)
     }
+
+    private fun String.toChapterNumberOrNull(): Float? = trim()
+        .replace(',', '.')
+        .toFloatOrNull()
 
     private operator fun ByteArray.plus(other: ByteArray): ByteArray {
         val result = ByteArray(this.size + other.size)
