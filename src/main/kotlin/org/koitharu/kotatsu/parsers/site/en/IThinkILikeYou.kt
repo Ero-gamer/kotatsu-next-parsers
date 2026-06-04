@@ -233,7 +233,7 @@ internal class IThinkILikeYou(context: MangaLoaderContext) :
 			?: doc.parseFailed("No comic content found")
 		return container.select("img")
 			.mapNotNull { it.src()?.fixImageHost() }
-			.filter { it.contains("/wp-content/uploads/") && !it.isResizedThumbnail() }
+			.filter { it.isContentImage() }
 			.distinct()
 			.map { url ->
 				MangaPage(
@@ -294,6 +294,18 @@ internal class IThinkILikeYou(context: MangaLoaderContext) :
 
 	// Strips WordPress resized variants like "image-300x150.png", keeping only full-size art.
 	private fun String.isResizedThumbnail(): Boolean = RESIZED_THUMBNAIL_REGEX.containsMatchIn(this)
+
+	/**
+	 * A real comic/story page image. Gated entries serve signed "?svw=1" URLs (not upload paths),
+	 * while open comics and free stories use plain /wp-content/uploads/ files. UltimateMember
+	 * profile photos and resized thumbnails are page furniture, not content.
+	 */
+	private fun String.isContentImage(): Boolean = when {
+		contains("/ultimatemember/") -> false
+		contains("svw=1") -> true
+		contains("/wp-content/uploads/") -> !isResizedThumbnail()
+		else -> false
+	}
 
 	// Story posts still embed images on the site's dead former domain (http://www.itily.net);
 	// the same paths are served by the current domain over https.
