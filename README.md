@@ -58,9 +58,7 @@ JVM and Android applications.
 
 ## Projects that use the library
 
-- [Kotatsu-Redo](https://github.com/Kotatsu-Redo/Kotatsu-Redo)
-- [Futon](https://github.com/AppFuton/Futon)
-- [Kototoro](https://github.com/Kototoro-app/Kototoro)
+- [Kotatsu Next](https://github.com/Ero-gamer/Kotatsu-NNext)
   
 ## Contribution
 
