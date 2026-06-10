@@ -2,11 +2,14 @@ package org.koitharu.kotatsu.parsers.site.en
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
+import org.koitharu.kotatsu.parsers.bitmap.Bitmap
+import org.koitharu.kotatsu.parsers.bitmap.Rect
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.exception.ParseException
@@ -16,6 +19,7 @@ import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 @MangaSourceParser("COMIX", "Comix", "en", ContentType.MANGA)
 internal class Comix(context: MangaLoaderContext) :
@@ -51,17 +55,27 @@ internal class Comix(context: MangaLoaderContext) :
         availableTags = fetchAvailableTags(),
     )
 
+    // The site's curated genres, keyed by the numeric id the API expects in
+    // `genres_in[]` (verified against /api/v1/tags/search?type=genre). The
+    // narrative "tags" (Demons, School Life, ...) live in a separate id space
+    // with thousands of entries and no listing endpoint, so they aren't
+    // enumerated here — they still work via search because every tag shown on
+    // a manga's detail page carries its own numeric id (see [parseTerms]),
+    // and any non-numeric tag key is resolved by name through [resolveTagId].
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
         return setOf(
-            // Genres
             MangaTag(key = "6", title = "Action", source = source),
+            MangaTag(key = "87264", title = "Adult", source = source),
             MangaTag(key = "7", title = "Adventure", source = source),
             MangaTag(key = "8", title = "Boys Love", source = source),
             MangaTag(key = "9", title = "Comedy", source = source),
             MangaTag(key = "10", title = "Crime", source = source),
             MangaTag(key = "11", title = "Drama", source = source),
+            MangaTag(key = "87265", title = "Ecchi", source = source),
             MangaTag(key = "12", title = "Fantasy", source = source),
             MangaTag(key = "13", title = "Girls Love", source = source),
+            MangaTag(key = "40", title = "Harem", source = source),
+            MangaTag(key = "87266", title = "Hentai", source = source),
             MangaTag(key = "14", title = "Historical", source = source),
             MangaTag(key = "15", title = "Horror", source = source),
             MangaTag(key = "16", title = "Isekai", source = source),
@@ -75,49 +89,12 @@ internal class Comix(context: MangaLoaderContext) :
             MangaTag(key = "23", title = "Romance", source = source),
             MangaTag(key = "24", title = "Sci-Fi", source = source),
             MangaTag(key = "25", title = "Slice of Life", source = source),
+            MangaTag(key = "87268", title = "Smut", source = source),
             MangaTag(key = "26", title = "Sports", source = source),
             MangaTag(key = "27", title = "Superhero", source = source),
             MangaTag(key = "28", title = "Thriller", source = source),
             MangaTag(key = "29", title = "Tragedy", source = source),
             MangaTag(key = "30", title = "Wuxia", source = source),
-            // Themes
-            MangaTag(key = "31", title = "Aliens", source = source),
-            MangaTag(key = "32", title = "Animals", source = source),
-            MangaTag(key = "33", title = "Cooking", source = source),
-            MangaTag(key = "34", title = "Crossdressing", source = source),
-            MangaTag(key = "35", title = "Delinquents", source = source),
-            MangaTag(key = "36", title = "Demons", source = source),
-            MangaTag(key = "37", title = "Genderswap", source = source),
-            MangaTag(key = "38", title = "Ghosts", source = source),
-            MangaTag(key = "39", title = "Gyaru", source = source),
-            MangaTag(key = "40", title = "Harem", source = source),
-            MangaTag(key = "41", title = "Incest", source = source),
-            MangaTag(key = "42", title = "Loli", source = source),
-            MangaTag(key = "43", title = "Mafia", source = source),
-            MangaTag(key = "44", title = "Magic", source = source),
-            MangaTag(key = "45", title = "Martial Arts", source = source),
-            MangaTag(key = "46", title = "Military", source = source),
-            MangaTag(key = "47", title = "Monster Girls", source = source),
-            MangaTag(key = "48", title = "Monsters", source = source),
-            MangaTag(key = "49", title = "Music", source = source),
-            MangaTag(key = "50", title = "Ninja", source = source),
-            MangaTag(key = "51", title = "Office Workers", source = source),
-            MangaTag(key = "52", title = "Police", source = source),
-            MangaTag(key = "53", title = "Post-Apocalyptic", source = source),
-            MangaTag(key = "54", title = "Reincarnation", source = source),
-            MangaTag(key = "55", title = "Reverse Harem", source = source),
-            MangaTag(key = "56", title = "Samurai", source = source),
-            MangaTag(key = "57", title = "School Life", source = source),
-            MangaTag(key = "58", title = "Shota", source = source),
-            MangaTag(key = "59", title = "Supernatural", source = source),
-            MangaTag(key = "60", title = "Survival", source = source),
-            MangaTag(key = "61", title = "Time Travel", source = source),
-            MangaTag(key = "62", title = "Traditional Games", source = source),
-            MangaTag(key = "63", title = "Vampires", source = source),
-            MangaTag(key = "64", title = "Video Games", source = source),
-            MangaTag(key = "65", title = "Villainess", source = source),
-            MangaTag(key = "66", title = "Virtual Reality", source = source),
-            MangaTag(key = "67", title = "Zombies", source = source),
         )
     }
 
@@ -150,23 +127,30 @@ internal class Comix(context: MangaLoaderContext) :
                 else -> addParam("order[chapter_updated_at]=desc")
             }
 
-            // Handle genre filtering
-            if (filter.tags.isNotEmpty()) {
-                for (tag in filter.tags) {
-                    addParam("genres_in[]=${tag.key}")
-                }
+            // Handle genre/tag filtering. A tag key is normally the numeric id
+            // the API wants; anything non-numeric (e.g. a tag tapped from a
+            // manga's detail page that predates this change) is resolved by name.
+            val includedIds = LinkedHashSet<String>()
+            for (tag in filter.tags) {
+                val id = tag.key.toIntOrNull()?.let { tag.key } ?: resolveTagId(tag.title)
+                if (id != null) includedIds.add(id)
+            }
+            for (id in includedIds) {
+                addParam("genres_in[]=$id")
             }
 
-            // Default exclude adult content
-            addParam("genres_ex[]=87264") // Adult
-            addParam("genres_ex[]=87266") // Hentai
-            addParam("genres_ex[]=87268") // Smut
-            addParam("genres_ex[]=87265") // Ecchi
+            // Default exclude adult content, unless the user explicitly asked
+            // for one of those genres via the filter.
+            for (excludeId in ADULT_EXCLUDE_IDS) {
+                if (excludeId !in includedIds) {
+                    addParam("genres_ex[]=$excludeId")
+                }
+            }
             addParam("limit=$pageSize")
             addParam("page=$page")
         }
 
-        val response = webClient.httpGet(url).parseJson()
+        val response = getApiJson(url)
         val result = response.getJSONObject("result")
         val items = result.getJSONArray("items")
 
@@ -218,9 +202,7 @@ internal class Comix(context: MangaLoaderContext) :
         val hashId = manga.url.substringAfter("/title/")
         val chaptersDeferred = async { getChapters(manga) }
 
-        // Get detailed manga info
-        val detailUrl = apiUrl("manga/$hashId")
-        val response = webClient.httpGet(detailUrl).parseJson()
+        val response = getApiJson(apiUrl("manga/$hashId"))
 
         if (response.has("result")) {
             val result = response.getJSONObject("result")
@@ -248,30 +230,90 @@ internal class Comix(context: MangaLoaderContext) :
             ?: JSONArray()
 
         return (0 until pages.length()).map { i ->
-            val rawUrl = when (val item = pages.get(i)) {
-                is JSONObject -> item.getString("url")
-                else -> item.toString()
-            }
+            val item = pages.optJSONObject(i)
+            val rawUrl = item?.getString("url") ?: pages.get(i).toString()
             val imageUrl = if (rawUrl.startsWith("http", ignoreCase = true) || baseUrl.isBlank()) {
                 rawUrl
             } else {
                 "$baseUrl/${rawUrl.trimStart('/')}"
             }
+            // `s == 1` marks a tile-scrambled image. The interceptor descrambles
+            // based on the response header, but tagging the URL keeps scrambled
+            // pages from colliding with any unscrambled namesake in the cache.
+            val finalUrl = if (item?.optInt("s", 0) == 1) "$imageUrl#$SCRAMBLED_FRAGMENT" else imageUrl
             MangaPage(
                 id = generateUid("$chapterId-$i"),
-                url = imageUrl,
+                url = finalUrl,
                 preview = null,
                 source = source,
             )
         }
     }
 
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val response = chain.proceed(chain.request())
+        if (!response.isSuccessful) {
+            return response
+        }
+        // The image CDN signals a tile-scrambled image with this header; it's
+        // the authoritative trigger (only scrambled images carry it, so API and
+        // HTML responses pass straight through). A zero seed means "not scrambled".
+        val seed = response.header("x-scramble-seed")?.toLongOrNull()?.toInt()
+        if (seed == null || seed == 0) {
+            return response
+        }
+        return context.redrawImageResponse(response) { bitmap ->
+            descramble(bitmap, seed)
+        }
+    }
+
+    // Reverses the site's 5x5 tile shuffle. The scramble order is a Fisher-Yates
+    // permutation driven by an LCG seeded with the `x-scramble-seed` header, so
+    // tile `i` of the scrambled image belongs at position `order[i]`.
+    private fun descramble(source: Bitmap, seed: Int): Bitmap {
+        val width = source.width
+        val height = source.height
+        val tileW = width / GRID_COLS
+        val tileH = height / GRID_ROWS
+        val order = buildScrambleOrder(seed, NUM_TILES)
+
+        val output = context.createBitmap(width, height)
+        // Copy the whole image first so any edge pixels left over from the
+        // integer tile division are preserved.
+        output.drawBitmap(source, Rect(0, 0, width, height), Rect(0, 0, width, height))
+
+        for (srcIdx in 0 until NUM_TILES) {
+            val dstIdx = order[srcIdx]
+            val srcCol = srcIdx % GRID_COLS
+            val srcRow = srcIdx / GRID_COLS
+            val dstCol = dstIdx % GRID_COLS
+            val dstRow = dstIdx / GRID_COLS
+            val srcRect = Rect(srcCol * tileW, srcRow * tileH, (srcCol + 1) * tileW, (srcRow + 1) * tileH)
+            val dstRect = Rect(dstCol * tileW, dstRow * tileH, (dstCol + 1) * tileW, (dstRow + 1) * tileH)
+            output.drawBitmap(source, srcRect, dstRect)
+        }
+        return output
+    }
+
+    private fun buildScrambleOrder(seed: Int, n: Int): IntArray {
+        val arr = IntArray(n) { it }
+        var state = seed
+        for (i in n - 1 downTo 1) {
+            state = state * LCG_MULTIPLIER + LCG_INCREMENT
+            val j = ((state.toLong() and 0xFFFFFFFFL) % (i + 1)).toInt()
+            val tmp = arr[i]
+            arr[i] = arr[j]
+            arr[j] = tmp
+        }
+        return arr
+    }
+
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        val allChapters = webViewChapterList(hashId)
-        val allChapterObjects = (0 until allChapters.length()).map { allChapters.getJSONObject(it) }
-        val chaptersBuilder = ChaptersListBuilder(allChapterObjects.size)
-        for (chapterData in allChapterObjects) {
+        val allChapters = loadAllChapters(hashId, manga.url.toAbsoluteUrl(domain))
+        val chaptersBuilder = ChaptersListBuilder(allChapters.length())
+        for (i in 0 until allChapters.length()) {
+            val chapterData = allChapters.getJSONObject(i)
             val chapterId = chapterData.getLong("id")
             val number = chapterData.getDouble("number").toFloat()
             val name = chapterData.optString("name", "").nullIfEmpty()
@@ -301,112 +343,76 @@ internal class Comix(context: MangaLoaderContext) :
         return chaptersBuilder.toList().reversed()
     }
 
+    private suspend fun loadAllChapters(hashId: String, pageUrl: String): JSONArray {
+        val apiPath = "/api/v1/manga/$hashId/chapters"
+        val response = evaluateWebViewApiJson(
+            pageUrl = pageUrl,
+            script = buildWebViewApiScript(
+                """
+                    const basePath = ${apiPath.toJsString()};
+                    const limit = 100;
+                    const items = [];
+                    const seen = new Set();
+                    for (let page = 1; page <= 200; page++) {
+                        const payload = await fetchProtected(basePath + "?limit=" + limit + "&page=" + page);
+                        const result = payload && payload.result ? payload.result : payload;
+                        const pageItems = Array.isArray(result && result.items) ? result.items : [];
+                        const meta = (result && (result.meta || result.pagination)) || {};
+                        const currentPage = Number((meta && (meta.page || meta.currentPage)) || page);
+                        const pageKey = pageItems.length > 0 ?
+                            String(pageItems[0].id) + ":" + String(pageItems[pageItems.length - 1].id) :
+                            "empty:" + page;
+                        if (seen.has(pageKey)) break;
+                        seen.add(pageKey);
+                        for (const item of pageItems) items.push(item);
+
+                        const hasNext = meta && (meta.hasNext === true || meta.hasNext === "true" ||
+                            meta.hasNext === 1 || meta.hasNext === "1");
+                        const hasNextFalse = meta && (meta.hasNext === false || meta.hasNext === "false" ||
+                            meta.hasNext === 0 || meta.hasNext === "0");
+                        const lastPage = Number(meta && (meta.lastPage || meta.totalPages || meta.pages ||
+                            meta.pageCount || meta.last_page || meta.total_pages));
+                        if (pageItems.length === 0 || hasNextFalse || (lastPage && currentPage >= lastPage)) {
+                            break;
+                        }
+                        if (!hasNext && pageItems.length < limit) {
+                            break;
+                        }
+                    }
+                    return JSON.stringify({ items: items });
+                """.trimIndent(),
+            ),
+        )
+        return response.optJSONArray("items") ?: JSONArray()
+    }
+
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
+    /**
+     * Plain GET against the JSON API (popular/latest/search/details). Matches the
+     * upstream Keiyoushi behaviour — these endpoints aren't request-signed. If the
+     * response isn't JSON it's almost certainly a Cloudflare interstitial, so we
+     * hand off to the in-app browser to clear it.
+     */
+    private suspend fun getApiJson(url: String): JSONObject {
+        val response = webClient.httpGet(url)
+        return runCatching { response.parseJson() }.getOrElse { e ->
+            requestCloudflareVerification(url, e)
+        }
+    }
+
     private suspend fun webViewApiJson(apiPath: String): JSONObject {
-        logDebug("webViewApiJson start path=$apiPath")
-        return evaluateWebViewJson(
-            label = apiPath,
+        return evaluateWebViewApiJson(
+            pageUrl = "https://$domain/?kotatsu_comix_bridge=${System.currentTimeMillis()}",
             script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
         )
     }
 
-    private suspend fun webViewChapterList(hashId: String): JSONArray {
-        val pathPrefix = "/api/v1/manga/$hashId/chapters?page="
-        logDebug("webViewChapterList start hashId=$hashId prefix=$pathPrefix")
-        val json = evaluateWebViewJson(
-            label = "chapters:$hashId",
-            script = buildWebViewApiScript(
-                """
-                    const all = [];
-                    const compact = (item) => ({
-                        id: item.id,
-                        number: item.number,
-                        name: item.name || "",
-                        createdAtFormatted: item.createdAtFormatted || "",
-                        isOfficial: !!item.isOfficial,
-                        group: item.group || item.scanlation_group || null
-                    });
-                    const mostActiveGroupId = (items) => {
-                        const counts = new Map();
-                        for (const item of items) {
-                            const group = item.group || item.scanlation_group;
-                            const id = group && group.id;
-                            if (id === undefined || id === null) continue;
-                            counts.set(String(id), (counts.get(String(id)) || 0) + 1);
-                        }
-                        let best = "";
-                        let bestCount = 0;
-                        for (const [id, count] of counts) {
-                            if (count > bestCount) {
-                                best = id;
-                                bestCount = count;
-                            }
-                        }
-                        return best;
-                    };
-                    const pagePath = (page, groupId) =>
-                        ${pathPrefix.toJsString()} + page +
-                            "&limit=$CHAPTER_API_LIMIT&order%5Bnumber%5D=desc" +
-                            (groupId ? "&group_id=" + encodeURIComponent(groupId) : "");
-
-                    const appendItems = (items) => {
-                        for (const item of items) all.push(compact(item));
-                    };
-                    const pageInfo = (result, fallbackPage) => {
-                        const pagination = (result && (result.pagination || result.meta)) || {};
-                        return {
-                            current: Number(pagination.page || pagination.current_page || fallbackPage),
-                            last: Number(pagination.lastPage || pagination.last_page || 1)
-                        };
-                    };
-
-                    const firstRoot = await fetchProtected(pagePath(1, ""));
-                    const firstResult = firstRoot && firstRoot.result ? firstRoot.result : firstRoot;
-                    if (!firstResult || !Array.isArray(firstResult.items)) {
-                        const keys = firstResult && typeof firstResult === "object" ? Object.keys(firstResult).join(",") : typeof firstResult;
-                        throw new Error("chapter payload has no items; keys=" + keys);
-                    }
-                    const firstItems = firstResult.items;
-                    if (!firstItems.length) {
-                        return JSON.stringify({ items: [], debug: { pages: 1, count: 0, groupId: "", firstPageCount: 0 } });
-                    }
-
-                    const groupId = mostActiveGroupId(firstItems);
-                    const firstPagination = pageInfo(firstResult, 1);
-                    let page = 1;
-                    if (!groupId) {
-                        appendItems(firstItems);
-                        page = firstPagination.current >= firstPagination.last ? $MAX_CHAPTER_API_PAGES + 1 : 2;
-                    }
-                    while (page <= $MAX_CHAPTER_API_PAGES) {
-                        const root = await fetchProtected(pagePath(page, groupId));
-                        const result = root && root.result ? root.result : root;
-                        if (!result || !Array.isArray(result.items)) {
-                            const keys = result && typeof result === "object" ? Object.keys(result).join(",") : typeof result;
-                            throw new Error("chapter payload has no items; keys=" + keys);
-                        }
-                        const items = result.items;
-                        appendItems(items);
-                        const pagination = pageInfo(result, page);
-                        if (!items.length || pagination.current >= pagination.last) break;
-                        page++;
-                    }
-                    return JSON.stringify({ items: all, debug: { pages: page, count: all.length, groupId, firstPageCount: firstItems.length } });
-                """.trimIndent(),
-            ),
-        )
-        val items = json.optJSONArray("items") ?: JSONArray()
-        logDebug("webViewChapterList done hashId=$hashId count=${items.length()} debug=${json.optJSONObject("debug")}")
-        return items
-    }
-
-    private suspend fun evaluateWebViewJson(label: String, script: String): JSONObject {
-        val bridgeScript = buildBridgeScript(script)
-        logDebug("evaluateWebViewJson intercept base=https://$domain/ label=$label scriptLen=${bridgeScript.length}")
+    private suspend fun evaluateWebViewApiJson(pageUrl: String, script: String): JSONObject {
+        val bridgeScript = buildWebViewApiBridgeScript(script)
         val requests = runCatching {
             context.interceptWebViewRequests(
-                "https://$domain/",
+                pageUrl,
                 InterceptionConfig(
                     timeoutMs = WEBVIEW_API_TIMEOUT,
                     maxRequests = 1,
@@ -415,41 +421,34 @@ internal class Comix(context: MangaLoaderContext) :
                 ),
             )
         }.getOrElse { e ->
-            throw ParseException("Comix WebView API interception failed", "https://$domain/", e)
+            throw ParseException("Comix WebView API interception failed", pageUrl, e)
         }
         val resultUrl = requests.firstOrNull()?.url
-            ?: throw ParseException("Comix WebView API did not return a bridge result", "https://$domain/")
-        logDebug("evaluateWebViewJson bridge label=$label url=${resultUrl.take(LOG_EXCERPT)}")
+            ?: throw ParseException("Comix WebView API did not return a bridge result", pageUrl)
         val decoded = when {
-            resultUrl.contains("/error?", ignoreCase = true) -> {
+            resultUrl.contains("/error", ignoreCase = true) -> {
                 val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
-                throw ParseException("Comix WebView API failed: $message", "https://$domain/")
+                throw ParseException("Comix WebView API failed: $message", pageUrl)
             }
             else -> resultUrl.queryParameterValue("data")
-                ?: throw ParseException("Comix WebView API bridge result missing data", "https://$domain/")
+                ?: throw ParseException("Comix WebView API bridge result missing data", pageUrl)
         }
-        logDebug("evaluateWebViewJson decoded label=$label len=${decoded.length} excerpt=${decoded.take(LOG_EXCERPT)}")
         if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
-            logDebug("evaluateWebViewJson cloudflare label=$label")
-            requestCloudflareVerification("https://$domain/")
+            requestCloudflareVerification(pageUrl)
         }
         if (decoded.isBlank()) {
-            logDebug("evaluateWebViewJson blank label=$label")
-            throw ParseException("Comix WebView API returned an empty response", "https://$domain/")
+            throw ParseException("Comix WebView API returned an empty response", pageUrl)
         }
         val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
-            logDebug("evaluateWebViewJson invalid json label=$label")
-            throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", "https://$domain/", e)
+            throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", pageUrl, e)
         }
-        logDebug("evaluateWebViewJson json label=$label keys=${json.keys().asSequence().joinToString(",")}")
         json.optString("error").nullIfEmpty()?.let { error ->
-            logDebug("evaluateWebViewJson error label=$label error=$error")
-            throw ParseException("Comix WebView API failed: $error", "https://$domain/")
+            throw ParseException("Comix WebView API failed: $error", pageUrl)
         }
         return json
     }
 
-    private fun buildBridgeScript(script: String): String {
+    private fun buildWebViewApiBridgeScript(script: String): String {
         return """
             (async function() {
                 try {
@@ -462,19 +461,11 @@ internal class Comix(context: MangaLoaderContext) :
         """.trimIndent()
     }
 
-    private fun requestCloudflareVerification(url: String, cause: Throwable? = null): Nothing {
-        try {
-            context.requestBrowserAction(this, url)
-        } catch (e: UnsupportedOperationException) {
-            throw ParseException(CLOUDFLARE_MESSAGE, url, cause ?: e)
-        }
-    }
-
     private fun buildWebViewApiScript(body: String): String {
         return """
             (async () => {
                 const probePath = "/manga/g2rk/chapters";
-                const tokenRegex = /^[A-Za-z0-9_-]{40,200}$/;
+                const tokenRegex = /^[A-Za-z0-9_-]{20,200}$/;
                 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 const challengeDetected = () => {
                     const root = document.documentElement;
@@ -543,7 +534,9 @@ internal class Comix(context: MangaLoaderContext) :
                 try {
                     let glue = null;
                     for (let attempt = 0; attempt < 80; attempt++) {
-                        if (challengeDetected()) return "$CLOUDFLARE_BLOCKED";
+                        if (challengeDetected()) {
+                            return "$CLOUDFLARE_BLOCKED";
+                        }
                         glue = findGlue();
                         if (glue) break;
                         await sleep(250);
@@ -577,7 +570,8 @@ internal class Comix(context: MangaLoaderContext) :
                         let text = "";
                         let signedUrl = "";
                         let lastError = "";
-                        for (const signablePath of signCandidates(apiPath)) {
+                        const candidates = signCandidates(apiPath);
+                        for (const signablePath of candidates) {
                             const sig = glue.signer(signablePath);
                             if (!sig) {
                                 lastError = "signer returned empty token";
@@ -625,6 +619,14 @@ internal class Comix(context: MangaLoaderContext) :
         """.trimIndent()
     }
 
+    private fun requestCloudflareVerification(url: String, cause: Throwable? = null): Nothing {
+        try {
+            context.requestBrowserAction(this, url)
+        } catch (e: UnsupportedOperationException) {
+            throw ParseException(CLOUDFLARE_MESSAGE, url, cause ?: e)
+        }
+    }
+
     private fun String.queryParameterValue(name: String): String? {
         val query = substringAfter('#', substringAfter('?', ""))
         if (query.isEmpty()) return null
@@ -644,22 +646,6 @@ internal class Comix(context: MangaLoaderContext) :
             .replace("\t", "\\t") + "\""
     }
 
-    private fun String.decodeWebViewString(): String {
-        if (length < 2 || first() != '"' || last() != '"') {
-            return this
-        }
-        return substring(1, lastIndex)
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-            .replace("\\/", "/")
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t")
-            .replace(UNICODE_ESCAPE_REGEX) { match ->
-                match.groupValues[1].toInt(16).toChar().toString()
-            }
-    }
-
     private fun isCloudflarePage(html: String): Boolean {
         if (html.isBlank()) return false
         val lower = html.lowercase(Locale.US)
@@ -670,11 +656,8 @@ internal class Comix(context: MangaLoaderContext) :
             lower.contains("challenge-platform") ||
             lower.contains("challenges.cloudflare.com") ||
             lower.contains("cf-turnstile") ||
-            lower.contains("turnstile")
-    }
-
-    private fun logDebug(message: String) {
-        println("COMIX_DEBUG: $message")
+            lower.contains("turnstile") ||
+            lower.contains("we're maintaining the site")
     }
 
     private fun parseTerms(json: JSONObject): Set<MangaTag> {
@@ -692,12 +675,43 @@ internal class Comix(context: MangaLoaderContext) :
             val title = item.optString("title").nullIfEmpty()
                 ?: item.optString("name").nullIfEmpty()
                 ?: return@mapNotNullTo null
+            // Prefer the numeric id — it's exactly what `genres_in[]` expects,
+            // so a tag chip tapped on the details page filters correctly with
+            // no name lookup. Fall back to the title for safety.
+            val key = item.optIntOrNull("id")?.toString() ?: title
             MangaTag(
-                key = title,
+                key = key,
                 title = title,
                 source = source,
             )
         }
+    }
+
+    private val tagIdCache = ConcurrentHashMap<String, String>()
+
+    /**
+     * Resolve a genre/tag name to the numeric id the API uses in `genres_in[]`,
+     * via the public /tags/search endpoint. Curated genres are looked up first
+     * (`type=genre`), then the larger narrative-tag space (`type=tag`). Results
+     * are cached; an empty string marks a name that matched nothing.
+     */
+    private suspend fun resolveTagId(name: String): String? {
+        val cacheKey = name.trim().lowercase(Locale.US)
+        if (cacheKey.isEmpty()) return null
+        tagIdCache[cacheKey]?.let { return it.nullIfEmpty() }
+        for (type in arrayOf("genre", "tag")) {
+            val url = apiUrl("tags/search?type=$type&q=${name.urlEncoded()}")
+            val result = runCatching {
+                webClient.httpGet(url).parseJson().optJSONArray("result")
+            }.getOrNull()
+            val id = result?.optJSONObject(0)?.optIntOrNull("id")?.toString()
+            if (id != null) {
+                tagIdCache[cacheKey] = id
+                return id
+            }
+        }
+        tagIdCache[cacheKey] = ""
+        return null
     }
 
     private fun parseAuthors(json: JSONObject): Set<String> {
@@ -740,16 +754,20 @@ internal class Comix(context: MangaLoaderContext) :
     private companion object {
         private val NSFW_RATINGS = setOf("erotica", "pornographic")
         private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
+        private val ADULT_EXCLUDE_IDS = listOf("87264", "87266", "87268", "87265") // Adult, Hentai, Smut, Ecchi
+        private const val SCRAMBLED_FRAGMENT = "scrambled"
+        private const val GRID_COLS = 5
+        private const val GRID_ROWS = 5
+        private const val NUM_TILES = GRID_COLS * GRID_ROWS
+        private const val LCG_MULTIPLIER = 1664525
+        private const val LCG_INCREMENT = 1013904223
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
-        private val UNICODE_ESCAPE_REGEX = Regex("""\\u([0-9A-Fa-f]{4})""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
-        private const val CHAPTER_API_LIMIT = 100
-        private const val MAX_CHAPTER_API_PAGES = 30
-        private const val LOG_EXCERPT = 500
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
         private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
-        private const val CLOUDFLARE_MESSAGE = "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
+        private const val CLOUDFLARE_MESSAGE =
+            "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
     }
 }

@@ -10,7 +10,7 @@ import org.koitharu.kotatsu.parsers.site.natsu.NatsuParser
 internal class Ikiru(context: MangaLoaderContext) :
     NatsuParser(context, MangaParserSource.IKIRU, pageSize = 24) {
 
-    override val configKeyDomain = ConfigKey.Domain("03.ikiru.wtf")
+    override val configKeyDomain = ConfigKey.Domain("05.ikiru.wtf")
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)

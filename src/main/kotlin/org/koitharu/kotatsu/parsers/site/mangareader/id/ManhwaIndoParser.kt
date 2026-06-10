@@ -10,7 +10,7 @@ import org.koitharu.kotatsu.parsers.util.*
 
 @MangaSourceParser("MANHWAINDO", "ManhwaIndo", "id")
 internal class ManhwaIndoParser(context: MangaLoaderContext) :
-    MangaReaderParser(context, MangaParserSource.MANHWAINDO, "manhwaindo.my", pageSize = 30, searchPageSize = 20) {
+    MangaReaderParser(context, MangaParserSource.MANHWAINDO, "www.manhwaindo.my", pageSize = 30, searchPageSize = 20) {
     override val listUrl = "/series"
     override val selectMangaList = "div.bs"
     override val selectMangaListImg = "img"
