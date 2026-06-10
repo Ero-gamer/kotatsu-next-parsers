@@ -58,7 +58,7 @@ JVM and Android applications.
 
 ## Projects that use the library
 
-- [Kotatsu Next](https://github.com/Ero-gamer/Kotatsu-NNext)
+- [Kotatsu Next](https://github.com/Ero-gamer/Kotatsu-Next)
   
 ## Contribution
 
