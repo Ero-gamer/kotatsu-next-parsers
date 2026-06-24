@@ -166,13 +166,21 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     /**
-     * Returns the manga items the `/browse` page exposes, read from the
-     * server-rendered `script#initial-data` JSON.
+     * Returns the manga items the `/browse` page exposes. The browse listing is
+     * not server-rendered — the page fetches it over a signed, encrypted XHR
+     * after hydration — so we load the page in a WebView and capture the payload
+     * it decrypts and parses (mirroring the upstream Keiyoushi fallback). A plain
+     * GET is tried first for the rare route that does inline `script#initial-data`.
      */
     private suspend fun loadBrowseItems(browseUrl: String): JSONArray {
-        val document = loadRenderedDocument(browseUrl) { extractInitialDataItems(it) != null }
-            ?: throw ParseException("Comix browse page returned no results", browseUrl)
-        return extractInitialDataItems(document)
+        runCatching { webClient.httpGet(browseUrl).parseHtml() }
+            .getOrNull()
+            ?.let { extractInitialDataItems(it) }
+            ?.let { return it }
+
+        val response = evaluateWebViewApiJson(browseUrl, BROWSE_CAPTURE_SCRIPT)
+        return response.optJSONObject("result")?.optJSONArray("items")
+            ?: response.optJSONArray("items")
             ?: throw ParseException("Comix browse page returned no results", browseUrl)
     }
 
@@ -957,6 +965,71 @@ internal class Comix(context: MangaLoaderContext) :
 
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
+
+        // Browse results arrive via a signed, encrypted XHR the page decrypts in
+        // JS, so we hook `JSON.parse` (catches the decrypted object), `fetch` and
+        // `XMLHttpRequest` (catch plain responses), plus poll `script#initial-data`
+        // as a backstop. Resolves with the first `{ result: { items: [...] } }`
+        // payload as a JSON string for the bridge to hand back.
+        private const val BROWSE_CAPTURE_SCRIPT = """
+            (async () => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const original = JSON.parse;
+                let captured = null;
+                const take = (obj) => {
+                    if (captured) return true;
+                    try {
+                        const items = obj && obj.result && obj.result.items;
+                        if (Array.isArray(items) && items.length > 0) {
+                            captured = JSON.stringify(obj);
+                            return true;
+                        }
+                    } catch (e) {}
+                    return false;
+                };
+                JSON.parse = function () {
+                    const parsed = original.apply(this, arguments);
+                    take(parsed);
+                    return parsed;
+                };
+                if (typeof window.fetch === 'function') {
+                    const originalFetch = window.fetch;
+                    window.fetch = function () {
+                        return originalFetch.apply(this, arguments).then((response) => {
+                            try {
+                                response.clone().text().then((text) => {
+                                    try { take(original(text)); } catch (e) {}
+                                }).catch(() => {});
+                            } catch (e) {}
+                            return response;
+                        });
+                    };
+                }
+                const originalSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.send = function () {
+                    this.addEventListener('load', function () {
+                        try { take(original(this.responseText)); } catch (e) {}
+                    });
+                    return originalSend.apply(this, arguments);
+                };
+                for (let i = 0; i < 200; i++) {
+                    if (captured) return captured;
+                    try {
+                        const node = document.querySelector('script#initial-data');
+                        if (node && node.textContent) {
+                            const queries = original(node.textContent).queries;
+                            if (queries) {
+                                for (const k in queries) {
+                                    if (take(queries[k]) || take({ result: queries[k] })) break;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                    await sleep(150);
+                }
+                return JSON.stringify({ error: 'no browse data captured' });
+            })()
+        """
 
         // Drives a WebView navigation past Cloudflare and returns the rendered
         // HTML. Resolves as soon as the SSR `script#initial-data` is present
