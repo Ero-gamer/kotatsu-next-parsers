@@ -559,32 +559,29 @@ internal class Comix(context: MangaLoaderContext) :
                 """
                     const basePath = ${apiPath.toJsString()};
                     const limit = 100;
-                    const items = [];
-                    const seen = new Set();
-                    for (let page = 1; page <= 200; page++) {
-                        const payload = await fetchProtected(basePath + "?limit=" + limit + "&page=" + page);
-                        const result = payload && payload.result ? payload.result : payload;
-                        const pageItems = Array.isArray(result && result.items) ? result.items : [];
-                        const meta = (result && (result.meta || result.pagination)) || {};
-                        const currentPage = Number((meta && (meta.page || meta.currentPage)) || page);
-                        const pageKey = pageItems.length > 0 ?
-                            String(pageItems[0].id) + ":" + String(pageItems[pageItems.length - 1].id) :
-                            "empty:" + page;
-                        if (seen.has(pageKey)) break;
-                        seen.add(pageKey);
-                        for (const item of pageItems) items.push(item);
+                    const unwrap = (payload) => (payload && payload.result ? payload.result : payload) || {};
+                    const itemsOf = (result) => Array.isArray(result && result.items) ? result.items : [];
 
-                        const hasNext = meta && (meta.hasNext === true || meta.hasNext === "true" ||
-                            meta.hasNext === 1 || meta.hasNext === "1");
-                        const hasNextFalse = meta && (meta.hasNext === false || meta.hasNext === "false" ||
-                            meta.hasNext === 0 || meta.hasNext === "0");
-                        const lastPage = Number(meta && (meta.lastPage || meta.totalPages || meta.pages ||
-                            meta.pageCount || meta.last_page || meta.total_pages));
-                        if (pageItems.length === 0 || hasNextFalse || (lastPage && currentPage >= lastPage)) {
-                            break;
+                    // Fetch the first page to learn the total, then pull the rest in
+                    // parallel. A slow page-by-page loop gets killed when the host
+                    // page reloads mid-flight, so we finish in just two round-trips.
+                    const firstResult = unwrap(await fetchProtected(basePath + "?limit=" + limit + "&page=1"));
+                    const items = itemsOf(firstResult).slice();
+                    const meta = (firstResult.meta || firstResult.pagination) || {};
+                    let lastPage = Number(
+                        meta.lastPage || meta.last_page || meta.totalPages ||
+                        meta.total_pages || meta.pageCount || meta.pages || 1
+                    ) || 1;
+                    if (lastPage > 200) lastPage = 200;
+
+                    if (lastPage > 1) {
+                        const requests = [];
+                        for (let page = 2; page <= lastPage; page++) {
+                            requests.push(fetchProtected(basePath + "?limit=" + limit + "&page=" + page));
                         }
-                        if (!hasNext && pageItems.length < limit) {
-                            break;
+                        const payloads = await Promise.all(requests);
+                        for (const payload of payloads) {
+                            for (const item of itemsOf(unwrap(payload))) items.push(item);
                         }
                     }
                     return JSON.stringify({ items: items });
