@@ -535,6 +535,7 @@ internal class Kagane(context: MangaLoaderContext) :
         } catch (e: Exception) {
             throw Exception("Invalid JSON token response: $responseBody")
         }
+        
         dbg("token response keys=${tokenResponse.keys().asSequence().toList()}")
 
         val token = tokenResponse.optString("access_token").ifBlank {
