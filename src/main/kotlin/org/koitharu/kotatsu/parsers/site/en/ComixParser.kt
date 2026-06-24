@@ -636,161 +636,13 @@ internal class Comix(context: MangaLoaderContext) :
         val titleUrl = "https://$domain/title/$hashId"
 
         // Let the title page fetch (and decrypt) its chapter list and capture what
-        // it parses. The script prefers the fast `group_id` path — pick the team
-        // with the most chapters and load only that team — and falls back to
-        // paginating every team via the "Next" button if the page won't sign our
-        // own group-filtered requests. We don't re-implement the request signing
-        // (that path hangs against the current bundle); we ride the page's own.
-        val basePath = "/api/v1/manga/$hashId/chapters"
-        val response = evaluateWebViewApiJson(titleUrl, buildChapterScript(basePath))
+        // it parses. The script prefers the fast single-team path: it reads the
+        // dominant team off the first page, then sets `?group_id=<id>` on the URL
+        // (the SPA reads it and refetches just that team), and paginates within it.
+        // If the URL filter doesn't take, it falls back to paginating every team.
+        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT)
         return response.optJSONArray("items") ?: JSONArray()
     }
-
-    private fun buildChapterScript(basePath: String): String = """
-        (async () => {
-            const original = JSON.parse;
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            const basePath = "$basePath";
-            const order = "&limit=20&order[number]=desc";
-
-            const candidateGids = new Set();
-            const pureCaptures = {};   // "gid:page" -> items (single-team responses)
-            const pureLastPage = {};   // gid -> lastPage
-            const mixedItems = [];     // accumulated all-teams items (fallback)
-            const mixedSeen = new Set();
-            let sawAny = false;
-
-            const isChapters = (arr) =>
-                Array.isArray(arr) && arr.length > 0 && arr[0] &&
-                arr[0].id !== undefined && arr[0].number !== undefined;
-
-            const onParsed = (parsed) => {
-                try {
-                    const result = parsed && parsed.result ? parsed.result : parsed;
-                    const arr = result && result.items;
-                    if (!isChapters(arr)) return;
-                    sawAny = true;
-                    const meta = (result.meta || result.pagination) || {};
-                    const page = Number(meta.page || 1);
-                    const lastPage = Number(
-                        meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
-                    ) || 1;
-                    for (const ch of arr) if (ch.groupId != null) candidateGids.add(String(ch.groupId));
-                    const gid0 = arr[0] && arr[0].groupId != null ? String(arr[0].groupId) : null;
-                    const pure = gid0 != null && arr.every((ch) => String(ch.groupId) === gid0);
-                    if (pure) {
-                        pureCaptures[gid0 + ':' + page] = arr;
-                        pureLastPage[gid0] = Math.max(pureLastPage[gid0] || 1, lastPage);
-                    } else if (!mixedSeen.has(page)) {
-                        mixedSeen.add(page);
-                        for (const ch of arr) mixedItems.push(ch);
-                    }
-                } catch (e) {}
-            };
-
-            JSON.parse = function () { const p = original.apply(this, arguments); onParsed(p); return p; };
-            if (typeof window.fetch === 'function') {
-                const of = window.fetch;
-                window.fetch = function () {
-                    return of.apply(this, arguments).then((res) => {
-                        try {
-                            res.clone().text().then((t) => { try { onParsed(original(t)); } catch (e) {} }).catch(() => {});
-                        } catch (e) {}
-                        return res;
-                    });
-                };
-            }
-            const os = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.send = function () {
-                this.addEventListener('load', function () { try { onParsed(original(this.responseText)); } catch (e) {} });
-                return os.apply(this, arguments);
-            };
-
-            const directFetch = (query) => {
-                try {
-                    window.fetch(basePath + '?' + query, {
-                        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-                        credentials: 'include'
-                    }).then((r) => r.text()).then((t) => { try { onParsed(original(t)); } catch (e) {} }).catch(() => {});
-                } catch (e) {}
-            };
-
-            // 1) Wait for the page's own first chapters request to land.
-            for (let i = 0; i < 150 && !sawAny; i++) await sleep(100);
-
-            // 2) Probe every candidate team's first page directly — this also tells
-            //    us if the page will sign our own fetches.
-            const gids = Array.from(candidateGids);
-            for (const gid of gids) directFetch('page=1' + order + '&group_id=' + gid);
-            for (let i = 0; i < 80; i++) {
-                let captured = 0;
-                for (const gid of gids) if (pureCaptures[gid + ':1']) captured++;
-                if (captured >= gids.length && gids.length > 0) break;
-                await sleep(100);
-            }
-
-            // 3) Direct group fetch works: pick the team with the most chapters and
-            //    load only that team (fast).
-            if (Object.keys(pureCaptures).length > 0) {
-                let best = null, bestPages = -1;
-                for (const gid of gids) {
-                    const lp = pureLastPage[gid] || (pureCaptures[gid + ':1'] ? 1 : 0);
-                    if (lp > bestPages) { bestPages = lp; best = gid; }
-                }
-                if (best != null) {
-                    const lp = Math.min(pureLastPage[best] || 1, 300);
-                    for (let p = 1; p <= lp; p++) {
-                        if (!pureCaptures[best + ':' + p]) directFetch('page=' + p + order + '&group_id=' + best);
-                    }
-                    for (let i = 0; i < 500; i++) {
-                        let all = true;
-                        for (let p = 1; p <= lp; p++) if (!pureCaptures[best + ':' + p]) { all = false; break; }
-                        if (all) break;
-                        await sleep(100);
-                    }
-                    const items = [];
-                    for (let p = 1; p <= lp; p++) {
-                        const a = pureCaptures[best + ':' + p];
-                        if (a) for (const ch of a) items.push(ch);
-                    }
-                    if (items.length > 0) return JSON.stringify({ items: items });
-                }
-            }
-
-            // 4) Fallback: paginate all teams via the "Next" button.
-            let done = false;
-            let lastActivity = Date.now();
-            let lastCount = mixedItems.length;
-            const clickNext = () => {
-                let tries = 0;
-                const iv = setInterval(() => {
-                    if (done) { clearInterval(iv); return; }
-                    let btn = document.querySelector('.mchap-foot button[aria-label*=Next]');
-                    if (!btn) {
-                        const buttons = document.querySelectorAll('button');
-                        for (const b of buttons) {
-                            const label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
-                            if (/next/i.test(label) && !b.disabled) { btn = b; break; }
-                        }
-                    }
-                    if (btn && !btn.disabled) { btn.click(); clearInterval(iv); }
-                    else if (++tries > 40) { clearInterval(iv); done = true; }
-                }, 100);
-            };
-            clickNext();
-            for (let i = 0; i < 800; i++) {
-                if (done) break;
-                if (mixedItems.length !== lastCount) {
-                    lastCount = mixedItems.length;
-                    lastActivity = Date.now();
-                    if (mixedSeen.size < 250) clickNext();
-                }
-                if (mixedItems.length > 0 && (Date.now() - lastActivity) > 9000) break;
-                await sleep(100);
-            }
-            return JSON.stringify({ items: mixedItems });
-        })()
-    """.trimIndent()
 
     private fun extractInitialDataPages(document: Document): JSONObject? {
         val raw = document.selectFirst("script#initial-data")?.data()?.nullIfEmpty() ?: return null
@@ -1013,6 +865,137 @@ internal class Comix(context: MangaLoaderContext) :
 
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
+
+        // Loads the chapter list, preferring a single team. It reads the dominant
+        // team off the all-teams first page, then switches the URL to that team's
+        // `?group_id=<id>` (pushState + popstate, which the SPA reads and refetches),
+        // and paginates within that team via the "Next" button. If the URL filter
+        // never yields a single-team response it falls back to paginating all teams.
+        // Resolves with `{ items: [...] }`.
+        private const val CHAPTER_SCRIPT = """
+            (async () => {
+                const original = JSON.parse;
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const mixedItems = [];
+                const mixedSeen = new Set();
+                const pureItems = [];
+                const purePages = new Set();
+                let targetGid = null;
+                let pureLastPage = 1;
+                let sawMixed = false;
+
+                const isChapters = (arr) =>
+                    Array.isArray(arr) && arr.length > 0 && arr[0] &&
+                    arr[0].id !== undefined && arr[0].number !== undefined;
+
+                const onParsed = (parsed) => {
+                    try {
+                        const result = parsed && parsed.result ? parsed.result : parsed;
+                        const arr = result && result.items;
+                        if (!isChapters(arr)) return;
+                        const meta = (result.meta || result.pagination) || {};
+                        const page = Number(meta.page || 1);
+                        const lastPage = Number(
+                            meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
+                        ) || 1;
+                        const gid0 = arr[0].groupId != null ? String(arr[0].groupId) : null;
+                        const pure = gid0 != null && arr.every((ch) => String(ch.groupId) === gid0);
+                        if (pure && targetGid != null && gid0 === targetGid) {
+                            if (!purePages.has(page)) { purePages.add(page); for (const ch of arr) pureItems.push(ch); }
+                            if (lastPage > pureLastPage) pureLastPage = lastPage;
+                        } else if (!pure) {
+                            sawMixed = true;
+                            if (!mixedSeen.has(page)) { mixedSeen.add(page); for (const ch of arr) mixedItems.push(ch); }
+                        }
+                    } catch (e) {}
+                };
+
+                JSON.parse = function () { const p = original.apply(this, arguments); onParsed(p); return p; };
+                if (typeof window.fetch === 'function') {
+                    const of = window.fetch;
+                    window.fetch = function () {
+                        return of.apply(this, arguments).then((res) => {
+                            try { res.clone().text().then((t) => { try { onParsed(original(t)); } catch (e) {} }).catch(() => {}); } catch (e) {}
+                            return res;
+                        });
+                    };
+                }
+                const os = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.send = function () {
+                    this.addEventListener('load', function () { try { onParsed(original(this.responseText)); } catch (e) {} });
+                    return os.apply(this, arguments);
+                };
+
+                const setGroup = (gid) => {
+                    try {
+                        const u = new URL(window.location.href);
+                        if (gid == null) u.searchParams.delete('group_id');
+                        else u.searchParams.set('group_id', String(gid));
+                        u.searchParams.delete('page');
+                        history.pushState({}, '', u.pathname + (u.search || ''));
+                        window.dispatchEvent(new PopStateEvent('popstate'));
+                    } catch (e) {}
+                };
+
+                const clickNext = (onFail) => {
+                    let tries = 0;
+                    const iv = setInterval(() => {
+                        let btn = document.querySelector('.mchap-foot button[aria-label*=Next]');
+                        if (!btn) {
+                            const buttons = document.querySelectorAll('button');
+                            for (const b of buttons) {
+                                const label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
+                                if (/next/i.test(label) && !b.disabled) { btn = b; break; }
+                            }
+                        }
+                        if (btn && !btn.disabled) { btn.click(); clearInterval(iv); }
+                        else if (++tries > 40) { clearInterval(iv); if (onFail) onFail(); }
+                    }, 100);
+                };
+
+                // 1) Wait for the page's own all-teams first request.
+                for (let i = 0; i < 150 && !sawMixed; i++) await sleep(100);
+
+                // 2) Pick the team that appears most on the first page (tie: newest).
+                const counts = {};
+                for (const ch of mixedItems) { const g = ch.groupId; if (g != null) counts[String(g)] = (counts[String(g)] || 0) + 1; }
+                let best = null, bestC = -1;
+                for (const g in counts) { if (counts[g] > bestC) { bestC = counts[g]; best = g; } }
+                if (best == null && mixedItems[0] && mixedItems[0].groupId != null) best = String(mixedItems[0].groupId);
+
+                // 3) Switch the URL to that team and paginate within it.
+                if (best != null) {
+                    targetGid = best;
+                    setGroup(best);
+                    let got = false;
+                    for (let i = 0; i < 70; i++) { if (purePages.size > 0) { got = true; break; } await sleep(100); }
+                    if (got) {
+                        let last = Date.now(), lastN = pureItems.length, stop = false;
+                        clickNext(() => { stop = true; });
+                        for (let i = 0; i < 900; i++) {
+                            if (purePages.size >= Math.min(pureLastPage, 300)) break;
+                            if (pureItems.length !== lastN) { lastN = pureItems.length; last = Date.now(); stop = false; if (purePages.size < 300) clickNext(() => { stop = true; }); }
+                            if (stop && (Date.now() - last) > 3000) break;
+                            if ((Date.now() - last) > 12000) break;
+                            await sleep(100);
+                        }
+                        if (pureItems.length > 0) return JSON.stringify({ items: pureItems });
+                    }
+                }
+
+                // 4) Fallback: paginate every team via the "Next" button.
+                setGroup(null);
+                let last = Date.now(), lastN = mixedItems.length, stop = false;
+                clickNext(() => { stop = true; });
+                for (let i = 0; i < 800; i++) {
+                    if (mixedItems.length !== lastN) { lastN = mixedItems.length; last = Date.now(); stop = false; if (mixedSeen.size < 250) clickNext(() => { stop = true; }); }
+                    if (stop && (Date.now() - last) > 3000) break;
+                    if (mixedItems.length > 0 && (Date.now() - last) > 9000) break;
+                    await sleep(100);
+                }
+                return JSON.stringify({ items: mixedItems });
+            })()
+        """
 
         // Browse results arrive via a signed, encrypted XHR the page decrypts in
         // JS, so we hook `JSON.parse` (catches the decrypted object), `fetch` and
