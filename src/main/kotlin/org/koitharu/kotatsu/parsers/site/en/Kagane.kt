@@ -203,11 +203,11 @@ internal class Kagane(context: MangaLoaderContext) :
             val ratings = filter.contentRating.ifEmpty {
                 EnumSet.of(ContentRating.SAFE, ContentRating.SUGGESTIVE, ContentRating.ADULT)
             }
-            if (ContentRating.SAFE in ratings) put("safe")
-            if (ContentRating.SUGGESTIVE in ratings) put("suggestive")
+            if (ContentRating.SAFE in ratings) put("Safe")
+            if (ContentRating.SUGGESTIVE in ratings) put("Suggestive")
             if (ContentRating.ADULT in ratings) {
-                put("erotica")
-                put("pornographic")
+                put("Erotica")
+                put("Pornographic")
             }
         })
 
