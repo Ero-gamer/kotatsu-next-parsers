@@ -133,7 +133,13 @@ internal abstract class BaseDoujinDesuParser(
 					publicUrl = href.toAbsoluteUrl(domain),
 					rating = obj.optDouble("rating", 0.0).toFloat() / 10f,
 					contentRating = ContentRating.ADULT,
-					coverUrl = obj.optString("cover_url").takeIf { it.isNotEmpty() },
+					coverUrl = obj.optString("cover_url").takeIf { it.isNotEmpty() }?.toAbsoluteUrl(domain)?.let { cover ->
+						if (cover.contains("doujindesu.")) {
+							cover.replace(Regex("https?://[^/]+"), "https://$domain")
+						} else {
+							cover
+						}
+					},
 					tags = emptySet(),
 					state = null,
 					authors = emptySet(),
@@ -211,12 +217,21 @@ internal abstract class BaseDoujinDesuParser(
 				.trim()
 		}
 
+		val coverUrl = obj.optString("cover_url").takeIf { it.isNotEmpty() }?.toAbsoluteUrl(domain)?.let { cover ->
+			if (cover.contains("doujindesu.")) {
+				cover.replace(Regex("https?://[^/]+"), "https://$domain")
+			} else {
+				cover
+			}
+		}
+
 		return manga.copy(
 			authors = setOfNotNull(author),
 			description = cleanDesc,
 			state = state,
 			rating = obj.optDouble("rating", 0.0).toFloat() / 10f,
 			tags = tags,
+			coverUrl = coverUrl ?: manga.coverUrl,
 			chapters = chapters.reversed()
 		)
 	}
