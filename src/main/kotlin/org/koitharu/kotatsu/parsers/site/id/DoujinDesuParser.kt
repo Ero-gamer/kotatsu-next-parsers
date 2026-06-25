@@ -22,7 +22,7 @@ internal abstract class BaseDoujinDesuParser(
 	protected abstract val availableContentTypes: Set<ContentType>
 
 	override val configKeyDomain: ConfigKey.Domain
-		get() = ConfigKey.Domain("doujin.desu.xxx", "doujindesu.xxx", "doujindesu.tv")
+		get() = ConfigKey.Domain("doujindesu.tv", "doujindesu.xxx", "doujin.desu.xxx")
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
@@ -134,7 +134,7 @@ internal abstract class BaseDoujinDesuParser(
 					rating = obj.optDouble("rating", 0.0).toFloat() / 10f,
 					contentRating = ContentRating.ADULT,
 					coverUrl = obj.optString("cover_url").takeIf { it.isNotEmpty() }?.toAbsoluteUrl(domain)?.let { cover ->
-						if (cover.contains("doujindesu.")) {
+						if (cover.contains("doujin")) {
 							cover.replace(Regex("https?://[^/]+"), "https://$domain")
 						} else {
 							cover
@@ -218,7 +218,7 @@ internal abstract class BaseDoujinDesuParser(
 		}
 
 		val coverUrl = obj.optString("cover_url").takeIf { it.isNotEmpty() }?.toAbsoluteUrl(domain)?.let { cover ->
-			if (cover.contains("doujindesu.")) {
+			if (cover.contains("doujin")) {
 				cover.replace(Regex("https?://[^/]+"), "https://$domain")
 			} else {
 				cover
