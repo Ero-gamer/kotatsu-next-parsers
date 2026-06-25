@@ -23,20 +23,20 @@ JVM and Android applications.
    For Java/Kotlin project:
     ```groovy
     dependencies {
-        implementation("com.github.KotatsuApp:kotatsu-parsers:$parsers_version")
+        implementation("com.github.Ero-gamer:kotatsu-next-parsers:$parsers_version:kotatsu-parsers:$parFors_version")
     }
     ```
 
    For Android project:
     ```groovy
     dependencies {
-        implementation("com.github.KotatsuApp:kotatsu-parsers:$parsers_version") {
+        implementation("com.github.Ero-gamer:kotatsu-next-parsers:$parsers_version") {
             exclude group: 'org.json', module: 'json'
         }
     }
     ```
 
-   Versions are available on [JitPack](https://jitpack.io/#KotatsuApp/kotatsu-parsers)
+   Versions are available on [JitPack](https://jitpack.io/#Ero-gamer/kotatsu-next-parsers)
 
    When used in Android
    projects, [core library desugaring](https://developer.android.com/studio/write/java8-support#library-desugaring) with
@@ -58,9 +58,7 @@ JVM and Android applications.
 
 ## Projects that use the library
 
-- [Kotatsu-Redo](https://github.com/Kotatsu-Redo/Kotatsu-Redo)
-- [Futon](https://github.com/AppFuton/Futon)
-- [Kototoro](https://github.com/Kototoro-app/Kototoro)
+- [Kotatsu Next](https://github.com/Ero-gamer/Kotatsu-Next)
   
 ## Contribution
 
