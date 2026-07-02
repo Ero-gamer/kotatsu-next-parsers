@@ -89,6 +89,9 @@ public abstract class AbstractMangaParser @InternalParsersApi constructor(
 	@CallSuper
 	public override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		keys.add(configKeyDomain)
+		if (keys.none { it is ConfigKey.InterceptCloudflare }) {
+			keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+		}
 	}
 
 	public override suspend fun getRelatedManga(seed: Manga): List<Manga> {

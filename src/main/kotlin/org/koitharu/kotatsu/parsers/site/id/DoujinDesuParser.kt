@@ -79,14 +79,14 @@ internal abstract class BaseDoujinDesuParser(
 				addQueryParameter("genres[]", it.key)
 			}
 
-			val orderParam = when (order) {
+			val sortParam = when (order) {
 				SortOrder.POPULARITY -> "popular"
 				SortOrder.ALPHABETICAL -> "title"
 				SortOrder.NEWEST -> "latest"
-				SortOrder.UPDATED -> "update"
-				else -> "latest"
+				SortOrder.UPDATED -> "latest_chapter"
+				else -> "latest_chapter"
 			}
-			addQueryParameter("order", orderParam)
+			addQueryParameter("sort", sortParam)
 
 			val typeParam = filter.types.oneOrThrowIfMany()?.let {
 				when (it) {
