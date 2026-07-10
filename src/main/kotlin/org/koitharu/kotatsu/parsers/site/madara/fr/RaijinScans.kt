@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.madara.fr
 
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -30,6 +31,7 @@ import org.koitharu.kotatsu.parsers.util.selectFirstOrThrow
 import org.koitharu.kotatsu.parsers.util.selectLast
 import org.koitharu.kotatsu.parsers.util.src
 import org.koitharu.kotatsu.parsers.util.textOrNull
+import org.koitharu.kotatsu.parsers.util.getCookies
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
 import org.koitharu.kotatsu.parsers.util.toTitleCase
 import org.koitharu.kotatsu.parsers.util.urlEncoded
@@ -56,6 +58,21 @@ internal class RaijinScans(context: MangaLoaderContext) :
 	override val selectGenre = "div.genre-list div.genre-link"
 	override val selectDesc = "div.description-content"
 	override val selectState = "div.stat-item:has(span:contains(État du titre)) span.manga"
+
+	override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
+		.apply {
+			val cookies = context.cookieJar.getCookies(domain)
+			val cookieString = cookies.filter { cookie ->
+				cookie.name == "cf_clearance" ||
+				cookie.name.startsWith("__cf") ||
+				cookie.name.startsWith("cf_")
+			}.joinToString("; ") { c -> "${c.name}=${c.value}" }
+
+			if (cookieString.isNotEmpty()) {
+				add("Cookie", cookieString)
+			}
+		}
+		.build()
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
@@ -237,7 +254,59 @@ internal class RaijinScans(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+
+		// First try the standard HTTP approach (faster, works when Cloudflare cookies are present)
 		val doc = webClient.httpGet(chapterUrl).parseHtml()
+
+		// Check if we're blocked by Cloudflare challenge
+		if (isCloudflareChallenge(doc)) {
+			// Use evaluateJs to load the page in a real browser and wait for images to load
+			try {
+				val jsPages = loadChapterPagesViaJs(chapterUrl)
+				if (jsPages.isNotEmpty()) {
+					return jsPages
+				}
+			} catch (e: Exception) {
+				// evaluateJs failed, try browser action below
+			}
+			// If JS evaluation also fails, request manual browser action
+			try {
+				context.requestBrowserAction(this, chapterUrl)
+			} catch (e: UnsupportedOperationException) {
+				// Browser action not available, continue with other fallbacks
+			}
+		}
+
+		// Try to find images that are already loaded (after JS execution)
+		val loadedImages = doc.select("figure.page img[src], div.reading-content img[src], div.protected-image-data img[src]")
+		if (loadedImages.isNotEmpty()) {
+			return loadedImages.mapNotNull { img ->
+				val imageUrl = img.attr("src").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+				MangaPage(
+					id = generateUid(imageUrl),
+					url = imageUrl,
+					preview = null,
+					source = source,
+				)
+			}
+		}
+
+		// Try Base64 encoded data-src
+		val base64Pages = doc.select(selectPage).mapNotNull { element ->
+			val encodedUrl = element.attr("data-src").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+			val imageUrl = String(context.decodeBase64(encodedUrl))
+			MangaPage(
+				id = generateUid(imageUrl),
+				url = imageUrl,
+				preview = null,
+				source = source,
+			)
+		}
+		if (base64Pages.isNotEmpty()) {
+			return base64Pages
+		}
+
+		// Fallback: try the old decodeRjAjaxConfig approach
 		decodeRjAjaxConfig(doc)?.let { config ->
 			val headers = getRequestHeaders().newBuilder()
 				.set("Referer", chapterUrl)
@@ -252,10 +321,61 @@ internal class RaijinScans(context: MangaLoaderContext) :
 			return pages.mapJsonPages(imageKey)
 		}
 
-		return doc.select(selectPage).map { element ->
-			val encodedUrl = element.attr("data-src")
-			val imageUrl = String(context.decodeBase64(encodedUrl))
+		return emptyList()
+	}
 
+	private suspend fun loadChapterPagesViaJs(chapterUrl: String): List<MangaPage> {
+		val script = """
+			(() => {
+				return new Promise(resolve => {
+					const isChallenge = () => {
+						const title = document.title.toLowerCase();
+						return title.includes('just a moment') ||
+							title.includes('un instant') ||
+							title.includes('vérification') ||
+							document.querySelector('script[src*="challenge-platform"]') !== null ||
+							document.querySelector('form[action*="__cf_chl"]') !== null;
+					};
+
+					const hasImages = () => {
+						return document.querySelectorAll('figure.page img[src], div.reading-content img[src], div.protected-image-data img[src]').length > 0;
+					};
+
+					if (hasImages()) {
+						return resolve(document.documentElement.outerHTML);
+					}
+
+					if (isChallenge()) {
+						return resolve("CLOUDFLARE_CHALLENGE");
+					}
+
+					let attempts = 0;
+					const maxAttempts = 80;
+					const timer = setInterval(() => {
+						attempts++;
+						if (hasImages() || isChallenge() || attempts >= maxAttempts) {
+							clearInterval(timer);
+							resolve(document.documentElement.outerHTML);
+						}
+					}, 250);
+				});
+			})()
+		""".trimIndent()
+
+		val rawHtml = try {
+			context.evaluateJs(chapterUrl, script, timeout = 30000L)
+		} catch (e: Exception) {
+			return emptyList()
+		} ?: return emptyList()
+
+		if (rawHtml == "CLOUDFLARE_CHALLENGE") {
+			return emptyList()
+		}
+
+		val jsDoc = Jsoup.parse(rawHtml, chapterUrl)
+		val images = jsDoc.select("figure.page img[src], div.reading-content img[src], div.protected-image-data img[src]")
+		return images.mapNotNull { img ->
+			val imageUrl = img.attr("src").takeIf { it.isNotBlank() } ?: return@mapNotNull null
 			MangaPage(
 				id = generateUid(imageUrl),
 				url = imageUrl,
@@ -263,6 +383,18 @@ internal class RaijinScans(context: MangaLoaderContext) :
 				source = source,
 			)
 		}
+	}
+
+	private fun isCloudflareChallenge(doc: Document): Boolean {
+		val title = doc.title().lowercase()
+		if (title.contains("just a moment") || title.contains("un instant") || title.contains("vérification")) {
+			return true
+		}
+		if (doc.selectFirst("script[src*=challenge-platform]") != null) return true
+		if (doc.selectFirst("form[action*=__cf_chl]") != null) return true
+		if (doc.getElementById("challenge-error-title") != null) return true
+		if (doc.getElementById("challenge-error-text") != null) return true
+		return false
 	}
 
 	private fun JSONArray.mapJsonPages(imageKey: String): List<MangaPage> {
@@ -279,11 +411,6 @@ internal class RaijinScans(context: MangaLoaderContext) :
 	}
 
 	private fun decodeRjAjaxConfig(doc: Document): RjAjaxConfig? {
-		// The reader config is delivered inline as window["rjfr_<hash>"].push({"m":..,"c":..}).
-		// "m" is a pipe-separated list of token ids giving the order in which the base64
-		// fragments in the "c" map must be concatenated; the result decodes to a JSON object
-		// {"m":[..],"d":[..],"l":[..]} where "d" holds the scrambled config and "m"/"l" are
-		// two permutations that must both be applied to recover the real field order.
 		val payloadJson = doc.select("script")
 			.firstNotNullOfOrNull { script -> RJ_PAYLOAD_REGEX.find(script.data())?.value }
 			?: return null
@@ -298,12 +425,10 @@ internal class RaijinScans(context: MangaLoaderContext) :
 		val firstOrder = inner.getJSONArray("m")
 		val scrambled = inner.getJSONArray("d")
 		val secondOrder = inner.getJSONArray("l")
-		// First pass: place each scrambled value at its index in "m".
 		val intermediate = arrayOfNulls<Any>(firstOrder.length())
 		for (i in 0 until firstOrder.length()) {
 			intermediate[firstOrder.getInt(i)] = scrambled.get(i)
 		}
-		// Second pass: gather through "l" to get the final, fixed field layout.
 		val values = arrayOfNulls<Any>(secondOrder.length())
 		for (j in 0 until secondOrder.length()) {
 			values[j] = intermediate[secondOrder.getInt(j)]
@@ -407,6 +532,6 @@ internal class RaijinScans(context: MangaLoaderContext) :
 	)
 
 	private companion object {
-		private val RJ_PAYLOAD_REGEX = Regex("""\{"m":"[^"]*","c":\{[^}]*\}\}""")
+		private val RJ_PAYLOAD_REGEX = Regex("""\{[^}]*"m":"[^"]*","c":\{[^}]*\}\}""")
 	}
 }
