@@ -1,4 +1,4 @@
-package org.koitharu.kotatsu.parsers.site.madara.id
+package org.koitharu.kotatsu.parsers.site.id
 
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -14,6 +14,8 @@ internal class Holotoon(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.HOTOON, 24) {
 
     override val configKeyDomain = ConfigKey.Domain("v1.holotoon.site")
+    
+    override val userAgentKey = ConfigKey.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0")
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(
         SortOrder.UPDATED,
@@ -24,7 +26,7 @@ internal class Holotoon(context: MangaLoaderContext) :
 
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
-            isMultipleTagsSupported = true,
+            isMultipleTagsSupported = false,
             isSearchSupported = true,
             isSearchWithFiltersSupported = true,
         )
@@ -41,6 +43,11 @@ internal class Holotoon(context: MangaLoaderContext) :
     init {
         paginator.firstPage = 1
         searchPaginator.firstPage = 1
+    }
+
+    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+        super.onCreateConfig(keys)
+        keys.add(userAgentKey)
     }
 
     private fun getListUrl(order: SortOrder, filter: MangaListFilter, page: Int): String {
@@ -203,7 +210,10 @@ internal class Holotoon(context: MangaLoaderContext) :
         val images = doc.select("div#reader-pages img, main img[src*='/image/']")
         return images.mapNotNull { img ->
             val url = img.attrOrNull("src")?.nullIfEmpty() ?: return@mapNotNull null
-            if (url.contains("/chapter-header/") || url.contains("/chapter-footer/")) return@mapNotNull null
+            if (url.contains("/chapter-header/") || url.contains("/chapter-footer/") || 
+                url.contains("/covers/") || url.contains("/reactions/") || 
+                url.contains("/avatars/") || url.contains("/shop/") || 
+                url.contains("/site-logo/")) return@mapNotNull null
             MangaPage(
                 id = generateUid(url),
                 url = url,
