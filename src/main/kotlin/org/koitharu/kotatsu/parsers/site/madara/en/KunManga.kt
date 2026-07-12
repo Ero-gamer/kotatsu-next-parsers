@@ -13,5 +13,6 @@ internal class KunManga(context: MangaLoaderContext) :
     override val withoutAjax = true
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
+        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
     }
 }

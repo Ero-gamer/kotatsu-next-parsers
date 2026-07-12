@@ -14,5 +14,6 @@ internal class MangaHubIo(context: MangaLoaderContext) :
 	MangaHubParser(context, MangaParserSource.MANGAHUB_IO, "mangahub.io", "m01") {
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
+        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
     }
 }

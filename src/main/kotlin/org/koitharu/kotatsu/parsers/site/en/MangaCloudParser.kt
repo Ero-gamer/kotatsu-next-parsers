@@ -30,6 +30,7 @@ internal class MangaCloud(context: MangaLoaderContext) :
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()

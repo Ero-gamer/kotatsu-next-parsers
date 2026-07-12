@@ -78,6 +78,7 @@ internal abstract class InitMangaParser(
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
 		if (isCloudflareProtected) {
+			keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 		}
 	}
 
