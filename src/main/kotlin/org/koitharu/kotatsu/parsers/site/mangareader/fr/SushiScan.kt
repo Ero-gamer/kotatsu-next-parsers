@@ -14,6 +14,5 @@ internal class SushiScan(context: MangaLoaderContext) :
 	override val datePattern = "MMM d, yyyy"
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
-        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
     }
 }

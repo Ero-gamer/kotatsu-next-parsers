@@ -27,7 +27,6 @@ internal abstract class BaseDoujinDesuParser(
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
-		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override val defaultSortOrder: SortOrder

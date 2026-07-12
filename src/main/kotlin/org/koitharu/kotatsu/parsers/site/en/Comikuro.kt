@@ -70,7 +70,6 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
-		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(

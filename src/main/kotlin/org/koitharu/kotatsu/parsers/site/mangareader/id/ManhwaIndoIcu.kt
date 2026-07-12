@@ -16,6 +16,5 @@ internal class ManhwaIndoIcu(context: MangaLoaderContext) :
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
-		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 }

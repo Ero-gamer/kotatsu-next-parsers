@@ -12,6 +12,5 @@ internal class AnisaScans(context: MangaLoaderContext) :
 	override val datePattern = "dd MMM, yyyy"
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
-        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
     }
 }
