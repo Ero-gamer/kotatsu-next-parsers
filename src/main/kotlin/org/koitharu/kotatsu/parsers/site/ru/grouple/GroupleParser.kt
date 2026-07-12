@@ -720,7 +720,7 @@ internal abstract class GroupleParser(
         private val HREF_CHAPTER_NUMBER_REGEX = Regex("""/vol\d+/([0-9]+(?:[.,]\d+)?)""", RegexOption.IGNORE_CASE)
         private val TITLE_CHAPTER_NUMBER_REGEX = Regex("""([0-9]+(?:[.,]\d+)?)\s*$""")
         private val FILTERS_REGEX = Regex(
-            """window\.__FILTERS\.(genre|category|limitation|another|searchFilters)\s*=\s*(\{.*?})\s*;""",
+            """window\.__FILTERS\.(genre|category|limitation|another|searchFilters)\s*=\s*([{].*?[}])\s*;""",
             RegexOption.DOT_MATCHES_ALL,
         )
     }
