@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.all
 
 import okhttp3.HttpUrl
 import org.json.JSONArray
+import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -26,6 +27,8 @@ import java.util.*
  * Multiple translation groups per chapter are exposed as separate [MangaChapter] entries
  * sharing the same chapter number but carrying distinct [MangaChapter.branch] values.
  */
+
+@Broken
 @MangaSourceParser("CUBARI", "Cubari", type = ContentType.OTHER)
 internal class CubariParser(context: MangaLoaderContext) :
 	AbstractMangaParser(context, MangaParserSource.CUBARI) {
