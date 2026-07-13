@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.zeistmanga.id
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -9,6 +11,7 @@ import org.koitharu.kotatsu.parsers.model.Manga
 import org.koitharu.kotatsu.parsers.model.MangaChapter
 import org.koitharu.kotatsu.parsers.model.MangaPage
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
+import org.koitharu.kotatsu.parsers.model.MangaState
 import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.site.zeistmanga.ZeistMangaParser
 import org.koitharu.kotatsu.parsers.util.*
@@ -20,99 +23,9 @@ internal class ReYume(context: MangaLoaderContext) :
 	ZeistMangaParser(context, MangaParserSource.REYUME, "www.re-yume.my.id") {
 
 	override val selectTags = "a[rel=tag]"
+	override val selectPage = "#zeist-manga-reader img"
 
-	override val filterCapabilities = org.koitharu.kotatsu.parsers.model.MangaListFilterCapabilities(
-		isSearchSupported = true,
-		isMultipleTagsSupported = true
-	)
-
-	override suspend fun getListPage(page: Int, order: org.koitharu.kotatsu.parsers.model.SortOrder, filter: org.koitharu.kotatsu.parsers.model.MangaListFilter): List<org.koitharu.kotatsu.parsers.model.Manga> {
-		val startIndex = maxMangaResults * (page - 1) + 1
-		val url = buildString {
-			append("https://")
-			append(domain)
-			append("/feeds/posts/default/-/")
-			when {
-				!filter.query.isNullOrEmpty() -> {
-					append("Series")
-					append("?alt=json&orderby=published&max-results=")
-					append((maxMangaResults + 1).toString())
-					append("&start-index=")
-					append(startIndex.toString())
-					append("&q=label:Series+")
-					append(filter.query.urlEncoded())
-				}
-				else -> {
-					if (filter.tags.isNotEmpty()) {
-						append(filter.tags.joinToString("/") { it.key.urlEncoded() })
-					} else {
-						append("Series")
-					}
-					append("?alt=json&orderby=published&max-results=")
-					append((maxMangaResults + 1).toString())
-					append("&start-index=")
-					append(startIndex.toString())
-				}
-			}
-		}
-
-		val json = webClient.httpGet(url).parseJson().getJSONObject("feed")
-		val list = if (json.toString().contains("\"entry\":")) {
-			parseMangaList(json.getJSONArray("entry"))
-		} else {
-			emptyList()
-		}
-		return if (list.size > maxMangaResults) list.dropLast(1) else list
-	}
-
-	override suspend fun getDetails(manga: org.koitharu.kotatsu.parsers.model.Manga): org.koitharu.kotatsu.parsers.model.Manga {
-		val baseDetails = super.getDetails(manga)
-		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
-		
-		val title = if (baseDetails.title == "Unknown manga" || baseDetails.title.isEmpty()) {
-			doc.selectFirst("h1#post-title")?.text() ?: baseDetails.title
-		} else {
-			baseDetails.title
-		}
-
-		var desc = baseDetails.description
-		if (desc.isNullOrEmpty()) {
-			desc = doc.getElementById("syn_bod")?.text() ?: ""
-		}
-
-		var author = baseDetails.authors
-		if (author.isEmpty()) {
-			val authorText = doc.getElementById("tauther")?.text() ?: doc.getElementById("tauthers")?.text()
-			if (!authorText.isNullOrEmpty()) {
-				author = setOf(authorText)
-			}
-		}
-
-		var state = baseDetails.state
-		if (state == null) {
-			val stateText = doc.select("span.capitalize").map { it.text().lowercase() }.firstOrNull { 
-				it in ongoing || it in finished || it in abandoned || it in paused 
-			}
-			if (stateText != null) {
-				state = when (stateText) {
-					in ongoing -> org.koitharu.kotatsu.parsers.model.MangaState.ONGOING
-					in finished -> org.koitharu.kotatsu.parsers.model.MangaState.FINISHED
-					in abandoned -> org.koitharu.kotatsu.parsers.model.MangaState.ABANDONED
-					in paused -> org.koitharu.kotatsu.parsers.model.MangaState.PAUSED
-					else -> null
-				}
-			}
-		}
-		
-		return baseDetails.copy(
-			title = title,
-			description = desc,
-			authors = author,
-			state = state
-		)
-	}
-
-	override fun parseMangaList(json: JSONArray): List<org.koitharu.kotatsu.parsers.model.Manga> {
+	override fun parseMangaList(json: JSONArray): List<Manga> {
 		return super.parseMangaList(json).map { 
 			val cleanUrl = it.url.substringBefore("?m=1").substringBefore("&m=1")
 			val cleanPublic = it.publicUrl.substringBefore("?m=1").substringBefore("&m=1")
@@ -124,9 +37,55 @@ internal class ReYume(context: MangaLoaderContext) :
 		}
 	}
 
+	override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
+		val baseDetails = super.getDetails(manga)
+		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+		
+		val title = doc.selectFirst("h1[itemprop=name], h1.post-title, h1#post-title")?.text() ?: baseDetails.title
+		var desc = baseDetails.description
+		if (desc.isNullOrEmpty()) {
+			desc = doc.getElementById("synopsis")?.text() 
+				?: doc.getElementById("syn_bod")?.text()
+				?: doc.selectFirst(".sinopsis")?.text()
+				?: ""
+		}
+		
+		val authorText = doc.getElementById("tauther")?.text() ?: doc.getElementById("tauthers")?.text()
+		val authors = if (!authorText.isNullOrEmpty()) setOf(authorText) else baseDetails.authors
+
+		val stateText = doc.select("span.capitalize, span.uppercase, span[data-bg]").map { it.text().lowercase() }.firstOrNull { 
+			it in ongoing || it in finished || it in abandoned || it in paused 
+		}
+		val state = when (stateText) {
+			in ongoing -> MangaState.ONGOING
+			in finished -> MangaState.FINISHED
+			in abandoned -> MangaState.ABANDONED
+			in paused -> MangaState.PAUSED
+			else -> baseDetails.state
+		}
+		
+		val chaptersDeferred = async { loadChapters(manga.url, doc) }
+
+		manga.copy(
+			title = title,
+			description = desc,
+			authors = authors,
+			state = state,
+			tags = doc.select(selectTags).mapToSet { a ->
+				MangaTag(
+					key = a.attr("href").substringAfterLast("label/").substringBefore("?"),
+					title = a.text().toTitleCase(),
+					source = source,
+				)
+			},
+			chapters = chaptersDeferred.await()
+		)
+	}
+
 	override suspend fun loadChapters(mangaUrl: String, doc: Document): List<MangaChapter> {
 		val label = doc.selectFirst(".chapter_get")?.attr("data-labelchapter")
 			?: doc.selectFirst(".libraryAdd")?.attr("data-title")
+			?: doc.html().substringAfter("clwd.run('", "").substringBefore("');").takeIf { it.isNotEmpty() }
 			?: return super.loadChapters(mangaUrl, doc)
 
 		val url = buildString {
@@ -139,12 +98,24 @@ internal class ReYume(context: MangaLoaderContext) :
 		
 		val json = webClient.httpGet(url).parseJson().getJSONObject("feed").getJSONArray("entry").asTypedList<JSONObject>().reversed()
 		val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
-		val mangaTitle = doc.selectFirst("h1#post-title")?.text().orEmpty()
+		val mangaTitle = doc.selectFirst("h1[itemprop=name], h1.post-title, h1#post-title")?.text().orEmpty()
 		
 		return json.mapIndexedNotNull { i, j ->
 			val name = j.getJSONObject("title").getString("\$t")
-			val chapterName = if (mangaTitle.isNotEmpty() && name.contains(mangaTitle, ignoreCase = true)) {
-				name.replace(mangaTitle, "", ignoreCase = true).trim().trim('-').trim().takeIf { it.isNotEmpty() } ?: name
+			val prefixToStrip = if (mangaTitle.isNotEmpty() && name.contains(mangaTitle, ignoreCase = true)) {
+				mangaTitle
+			} else if (label.isNotEmpty() && name.contains(label, ignoreCase = true)) {
+				label
+			} else {
+				""
+			}
+			
+			val chapterName = if (prefixToStrip.isNotEmpty() && name.contains(prefixToStrip, ignoreCase = true)) {
+				name.replace(prefixToStrip, "", ignoreCase = true)
+					.trim()
+					.trim('-', ',', '~', ':')
+					.trim()
+					.takeIf { it.isNotEmpty() } ?: name
 			} else {
 				name
 			}
@@ -168,30 +139,39 @@ internal class ReYume(context: MangaLoaderContext) :
 	}
 
 	override suspend fun fetchAvailableTags(): Set<MangaTag> {
-		val doc = webClient.httpGet("https://$domain").parseHtml()
-		val script = doc.selectFirst("script:containsData(filterGenre =)")?.data()
-		if (script != null) {
-			val genres = script.substringAfter("filterGenre = [").substringBefore("]")
-				.replace("'", "").replace("\"", "").split(",")
-			return genres.mapToSet {
-				val tag = it.trim()
-				MangaTag(key = tag, title = tag, source = source)
-			}
+		val genres = listOf(
+			"Action", "Adventure", "Comedy", "Drama", "Fantasy", "Horror", "Mystery", 
+			"Psychological", "Romance", "Sci-Fi", "Slice of Life", "Supernatural", 
+			"Thriller", "Tragedy", "Isekai", "Magic", "Shounen", "Seinen", "Shoujo", 
+			"Josei", "Martial Arts", "Historical", "School Life"
+		)
+		return genres.mapToSet { tag ->
+			MangaTag(key = tag, title = tag, source = source)
 		}
-		return super.fetchAvailableTags()
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		return doc.select(selectPage)
-			.filter { el -> el.parents().any { it.className().contains("separator") } }
-			.map { img ->
+
+		val textarea = doc.getElementById("zeist-raw-data")
+		if (textarea != null) {
+			val rawHtml = textarea.text()
+			val imgRegex = Regex("""<img[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+			val images = imgRegex.findAll(rawHtml).mapNotNull { matchResult ->
+				val url = matchResult.groupValues[1]
 				MangaPage(
-					id = generateUid(img.requireSrc()),
-					url = img.requireSrc(),
+					id = generateUid(url),
+					url = url,
 					preview = null,
 					source = source,
 				)
+			}.toList()
+			
+			if (images.isNotEmpty()) {
+				return images
 			}
+		}
+
+		return super.getPages(chapter)
 	}
 }

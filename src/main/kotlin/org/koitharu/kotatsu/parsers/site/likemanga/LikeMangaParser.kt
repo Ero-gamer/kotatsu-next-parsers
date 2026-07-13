@@ -30,7 +30,7 @@ internal abstract class LikeMangaParser(
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
-        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()

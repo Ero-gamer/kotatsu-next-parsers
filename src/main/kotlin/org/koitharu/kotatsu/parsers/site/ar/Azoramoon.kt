@@ -14,14 +14,14 @@ import org.koitharu.kotatsu.parsers.util.json.toJSONObjectOrNull
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("AZORAMOON", "Azoramoon", "ar")
+@MangaSourceParser("AZORAMOON", "Azorafly", "ar")
 internal class Azoramoon(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.AZORAMOON, 24) {
 
 	override val availableSortOrders: Set<SortOrder> =
 		EnumSet.of(SortOrder.UPDATED, SortOrder.POPULARITY, SortOrder.ALPHABETICAL)
 
-	override val configKeyDomain = ConfigKey.Domain("azoramoon.com")
+	override val configKeyDomain = ConfigKey.Domain("azorafly.com")
 
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(
