@@ -58,12 +58,8 @@ JVM and Android applications.
 
 ## Projects that use the library
 
-- [Kotatsu](https://github.com/KotatsuApp/Kotatsu)
-- [Doki](https://github.com/DokiTeam/Doki)
-- [kotatsu-dl](https://github.com/KotatsuApp/kotatsu-dl)
-- [Shirizu (WIP)](https://github.com/ztimms73/shirizu)
-- [OtakuWorld](https://github.com/jakepurple13/OtakuWorld)
-
+- [Kotatsu Next](https://github.com/Ero-gamer/Kotatsu-Next)
+  
 ## Contribution
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the guidelines.
