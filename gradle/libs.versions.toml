@@ -1,7 +1,7 @@
 [versions]
 kotlin = "2.2.10"
 ksp = "2.2.10-2.0.2"
-coroutines = "1.10.2"
+coroutines = "1.11.0"
 junit = "5.10.1"
 okhttp = "5.1.0"
 okio = "3.17.0"
