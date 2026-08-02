@@ -527,17 +527,13 @@ internal class Comix(context: MangaLoaderContext) :
             return emptyList()
         }
 
-        // Comix mixes many scanlation teams into one list, which is messy to read
-        // and full of duplicates. Pick the single most consistent team (best
-        // coverage of the whole range, present at both the newest and oldest
-        // chapters) and keep only its chapters, deduplicated per number.
-        val chosenTeam = selectConsistentTeamKey(parsed)
-        val chapters = parsed
-            .filter { chosenTeam == null || teamKeyOf(it) == chosenTeam }
-            .let(::dedupByNumber)
-            // The site serves chapters newest-first and the capture script merges
-            // several pages, so order the list here instead of trusting either.
-            .sortedBy { it.optDouble("number", 0.0) }
+        // Every scanlation team is kept: each one becomes its own branch, so the
+        // reader gets the site's full "All groups" list with a translation
+        // picker rather than a single team chosen for it.
+        //
+        // The site serves chapters newest-first and the capture script merges
+        // several pages, so order the list here instead of trusting either.
+        val chapters = parsed.sortedBy { it.optDouble("number", 0.0) }
 
         val chaptersBuilder = ChaptersListBuilder(chapters.size)
         for (chapterData in chapters) {
@@ -586,67 +582,10 @@ internal class Comix(context: MangaLoaderContext) :
         return parseRelativeDate(chapter.optString("date"))
     }
 
-    private fun teamKeyOf(chapter: JSONObject): String {
-        chapter.optIntOrNull("groupId")?.let { return "g$it" }
-        chapter.optString("groupName").nullIfEmpty()?.let { return "n:${it.lowercase(Locale.US)}" }
-        return if (chapter.optBoolean("official")) "official" else "unknown"
-    }
-
+    /** The branch a chapter belongs to — its scanlation team. */
     private fun teamNameOf(chapter: JSONObject): String {
         return chapter.optString("groupName").nullIfEmpty()
             ?: if (chapter.optBoolean("official")) "Official" else "Unknown"
-    }
-
-    /**
-     * Picks the most consistent scanlation team to read a series with: the one
-     * covering the most distinct chapter numbers, tie-broken by reaching the
-     * latest chapter, then the earliest, then total votes. This favours a team
-     * that scanlated the whole run end-to-end over one that did a few chapters.
-     */
-    private fun selectConsistentTeamKey(chapters: List<JSONObject>): String? {
-        if (chapters.isEmpty()) return null
-        val globalMax = chapters.maxOf { it.optDouble("number", 0.0) }
-
-        val numbers = HashMap<String, MutableSet<Double>>()
-        val minNumber = HashMap<String, Double>()
-        val maxNumber = HashMap<String, Double>()
-        val votes = HashMap<String, Long>()
-        for (chapter in chapters) {
-            val key = teamKeyOf(chapter)
-            val number = chapter.optDouble("number", 0.0)
-            numbers.getOrPut(key) { HashSet() }.add(number)
-            minNumber[key] = minOf(minNumber[key] ?: Double.MAX_VALUE, number)
-            maxNumber[key] = maxOf(maxNumber[key] ?: -Double.MAX_VALUE, number)
-            votes[key] = (votes[key] ?: 0L) + chapter.optLong("votes", 0L)
-        }
-
-        return numbers.keys.maxWithOrNull(
-            compareBy(
-                { numbers.getValue(it).size },
-                { if ((maxNumber[it] ?: 0.0) >= globalMax) 1 else 0 },
-                { -(minNumber[it] ?: 0.0) },
-                { votes[it] ?: 0L },
-            ),
-        )
-    }
-
-    /** Keep one chapter per number, preferring the most-voted (then newest id). */
-    private fun dedupByNumber(chapters: List<JSONObject>): List<JSONObject> {
-        val byNumber = LinkedHashMap<Double, JSONObject>()
-        for (chapter in chapters) {
-            val number = chapter.optDouble("number", 0.0)
-            val current = byNumber[number]
-            if (current == null) {
-                byNumber[number] = chapter
-            } else {
-                val newVotes = chapter.optLong("votes", 0L)
-                val curVotes = current.optLong("votes", 0L)
-                val better = newVotes > curVotes ||
-                    (newVotes == curVotes && chapter.optLong("id", 0L) > current.optLong("id", 0L))
-                if (better) byNumber[number] = chapter
-            }
-        }
-        return byNumber.values.toList()
     }
 
     private suspend fun loadAllChapters(hashId: String): JSONArray {
