@@ -107,7 +107,7 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		val doc = webClient.httpGet(url).parseHtml()
 		return doc.select("#series-grid .series-card").mapNotNull { card ->
 			val link = card.selectFirst("a[href*=/comics/]") ?: return@mapNotNull null
-			val href = link.attrAsRelativeUrl("href")
+			val href = link.attrAsRelativeUrl("href").stripSlugToken()
 			Manga(
 				id = generateUid(href),
 				url = href,
@@ -183,7 +183,7 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 			tags = tags,
 			authors = setOf(author),
 			chapters = doc.select("a.group[href*=/chapter/]").mapChapters(reversed = true) { i, a ->
-				val urlRelative = a.attrAsRelativeUrl("href")
+				val urlRelative = a.attrAsRelativeUrl("href").stripSlugToken()
 				val titleElement = a.selectFirst("span.font-medium") ?: a.selectFirst("span")
 				val chapterLabel = titleElement?.text()?.trim()?.takeIf { it.isNotEmpty() }
 				val chapterTitle = a.selectFirst("span.text-sm.text-white\\/50")
@@ -310,8 +310,23 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		}
 	}
 
+	/**
+	 * Asura appends the same site-wide token to every series slug
+	 * (`/comics/<slug>-00dcbf97`, identical across all series) and rotates it
+	 * whenever the site is redeployed — which is exactly when new chapters go
+	 * up. Any id derived from a url containing it therefore changes for every
+	 * chapter of every series at once, so chapters already downloaded come back
+	 * as new, undownloaded ones.
+	 *
+	 * The token is not needed to reach anything: the server answers a slug with
+	 * a missing or stale token with a 302 to the current url, so it is dropped
+	 * from the stored url and, with it, from the generated ids.
+	 */
+	private fun String.stripSlugToken(): String = replace(slugTokenRegex, "")
+
 	private companion object {
 		private const val CHAPTER_HIDE_WINDOW_MS = 6L * 60L * 60L * 1000L
+		private val slugTokenRegex = Regex("""-[0-9a-f]{8}(?=/|$)""")
 		private val chapterNumberRegex = Regex("""Chapter\s+(\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
 		private val pageUrlRegex = Regex(""""url":\s*\[0,\s*"([^"]+)"""")
 		private val ASURA_GENRES = listOf(

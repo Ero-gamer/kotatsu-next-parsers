@@ -521,11 +521,17 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        val allChapters = loadAllChapters(hashId)
-        val parsed = (0 until allChapters.length()).mapNotNull { allChapters.optJSONObject(it) }
+        val payload = loadAllChapters(hashId)
+        val rawItems = payload.optJSONArray("items") ?: return emptyList()
+        val parsed = (0 until rawItems.length()).mapNotNull { rawItems.optJSONObject(it) }
         if (parsed.isEmpty()) {
             return emptyList()
         }
+
+        // The script sends the shared URL prefix and the group list once and has
+        // every chapter reference them by index — see [CHAPTER_SCRIPT].
+        val urlPrefix = payload.optString("prefix")
+        val groups = payload.optJSONArray("groups")
 
         // Every scanlation team is kept: each one becomes its own branch, so the
         // reader gets the site's full "All groups" list with a translation
@@ -533,31 +539,32 @@ internal class Comix(context: MangaLoaderContext) :
         //
         // The site serves chapters newest-first and the capture script merges
         // several pages, so order the list here instead of trusting either.
-        val chapters = parsed.sortedBy { it.optDouble("number", 0.0) }
+        val chapters = parsed.sortedBy { it.optDouble("n", 0.0) }
 
         val chaptersBuilder = ChaptersListBuilder(chapters.size)
         for (chapterData in chapters) {
-            val chapterId = chapterData.optLong("id")
-            val number = chapterData.optDouble("number", 0.0).toFloat()
-            val name = chapterData.optString("name").nullIfEmpty()
-            val scanlator = teamNameOf(chapterData)
+            val chapterId = chapterData.optLong("i")
+            val number = chapterData.optDouble("n", 0.0).toFloat()
+            val name = chapterData.optString("t").nullIfEmpty()
+            val scanlator = teamNameOf(groups?.optJSONObject(chapterData.optInt("g", -1)))
             val label = number.toChapterUrlPart()
             val title = if (name != null) {
                 "Chapter $label: $name"
             } else {
                 "Chapter $label"
             }
-            // Prefer the canonical path the API provides — it carries the full
-            // title slug (e.g. `/title/x0ynk-villains.../<id>-chapter-N`). The
-            // hashId-only path 404s in the reader.
-            val chapterUrl = chapterData.optString("url").nullIfEmpty()
+            // Prefer the canonical path the site itself links to — it carries the
+            // full title slug (e.g. `/title/x0ynk-villains.../<id>-chapter-N`).
+            // The hashId-only path 404s in the reader.
+            val chapterUrl = chapterData.optString("u").nullIfEmpty()
+                ?.let { urlPrefix + it }
                 ?: "/title/$hashId/$chapterId-chapter-$label"
             chaptersBuilder.add(
                 MangaChapter(
                     id = generateUid("$scanlator-$chapterId"),
                     title = title,
                     number = number,
-                    volume = chapterData.optIntOrNull("volume")?.coerceAtLeast(0) ?: 0,
+                    volume = chapterData.optIntOrNull("v")?.coerceAtLeast(0) ?: 0,
                     url = chapterUrl,
                     uploadDate = chapterUploadDate(chapterData),
                     source = source,
@@ -571,24 +578,24 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     /**
-     * The capture script emits an epoch timestamp when the API payload carried
-     * one and only the site's relative label ("3 days ago") when the row was
-     * read off the rendered list.
+     * The capture script emits an epoch timestamp (`c`) when the API payload
+     * carried one, and only the site's relative label (`d`, "3 days ago") when
+     * the row was read off the rendered list.
      */
     private fun chapterUploadDate(chapter: JSONObject): Long {
-        chapter.optLongOrNull("createdAt")?.let { raw ->
+        chapter.optLongOrNull("c")?.let { raw ->
             return if (raw < SECONDS_TIMESTAMP_LIMIT) raw * 1000L else raw
         }
-        return parseRelativeDate(chapter.optString("date"))
+        return parseRelativeDate(chapter.optString("d"))
     }
 
     /** The branch a chapter belongs to — its scanlation team. */
-    private fun teamNameOf(chapter: JSONObject): String {
-        return chapter.optString("groupName").nullIfEmpty()
-            ?: if (chapter.optBoolean("official")) "Official" else "Unknown"
+    private fun teamNameOf(group: JSONObject?): String {
+        return group?.optString("name")?.nullIfEmpty()
+            ?: if (group?.optInt("o") == 1) "Official" else "Unknown"
     }
 
-    private suspend fun loadAllChapters(hashId: String): JSONArray {
+    private suspend fun loadAllChapters(hashId: String): JSONObject {
         val titleUrl = "https://$domain/title/$hashId"
 
         // The title page ships no chapters in `script#initial-data` — the list is
@@ -596,15 +603,15 @@ internal class Comix(context: MangaLoaderContext) :
         // it for us. [CHAPTER_SCRIPT] scrapes the rendered list and walks the
         // pager, which is why it doesn't matter that our hooks are installed only
         // after the first request has already been made and parsed.
-        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT)
+        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT, CHAPTER_WEBVIEW_TIMEOUT)
         val items = response.optJSONArray("items")
             ?: throw ParseException("Comix chapter capture returned no items array", titleUrl)
         // `empty` means the page rendered its "No chapters match." state, i.e. the
-        // title really has none — as opposed to us timing out before it rendered.
+        // title really has none — as opposed to us never seeing it render.
         if (items.length() == 0 && !response.optBoolean("empty")) {
-            throw ParseException("Comix chapter list did not load in time", titleUrl)
+            throw ParseException("Comix chapter list did not load", titleUrl)
         }
-        return items
+        return response
     }
 
     private fun extractInitialDataPages(document: Document): JSONObject? {
@@ -620,13 +627,17 @@ internal class Comix(context: MangaLoaderContext) :
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
-    private suspend fun evaluateWebViewApiJson(pageUrl: String, script: String): JSONObject {
+    private suspend fun evaluateWebViewApiJson(
+        pageUrl: String,
+        script: String,
+        timeoutMs: Long = WEBVIEW_API_TIMEOUT,
+    ): JSONObject {
         val bridgeScript = buildWebViewApiBridgeScript(script)
         val requests = runCatching {
             context.interceptWebViewRequests(
                 pageUrl,
                 InterceptionConfig(
-                    timeoutMs = WEBVIEW_API_TIMEOUT,
+                    timeoutMs = timeoutMs,
                     maxRequests = 1,
                     urlPattern = INTERCEPT_URL_REGEX,
                     pageScript = bridgeScript,
@@ -824,11 +835,15 @@ internal class Comix(context: MangaLoaderContext) :
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
 
-        // How long [CHAPTER_SCRIPT] may keep paginating, counted from navigation
-        // start. Kept below [WEBVIEW_API_TIMEOUT] so a title with more chapters
-        // than fit in the budget still returns the pages it managed to collect
-        // instead of being killed mid-run and yielding nothing.
-        private const val CHAPTER_SCRIPT_BUDGET_MS = 80000
+        // Chapter collection is not time-boxed: [CHAPTER_SCRIPT] pages until the
+        // site reports the list complete. This is only the ceiling for a WebView
+        // that has stopped responding altogether, so it is deliberately far
+        // higher than any real chapter list should need.
+        private const val CHAPTER_WEBVIEW_TIMEOUT = 600000L
+
+        // How long the script waits for one page to render before deciding the
+        // list has stalled and returning what it already has.
+        private const val CHAPTER_STALL_MS = 45000
 
         // Below this, a timestamp is seconds rather than milliseconds
         // (2286-11-20 in seconds, 1973-03-03 in milliseconds).
@@ -852,23 +867,34 @@ internal class Comix(context: MangaLoaderContext) :
         // matter when we arrive) and the payload hooks only enrich the pages that
         // are fetched later, while we walk the pager.
         //
-        // Everything is normalised to one flat shape so the result stays small
-        // enough to survive the fragment-URL bridge on long series:
-        // `{ items: [{ id, number, volume, name, url, groupId, groupName,
-        //              official, votes, createdAt, date }], empty }`.
+        // There is no page or item limit: it keeps paging until the site says the
+        // list is complete, and only gives up if a page stops responding for
+        // [CHAPTER_STALL_MS].
+        //
+        // The result crosses back as a URL fragment, so it is emitted in a
+        // compact form — the shared URL prefix and the scanlation groups are sent
+        // once and referenced by index, and absent fields are omitted:
+        //   prefix  shared start of every chapter URL
+        //   groups  [{ id?, name?, o }] — o = 1 when the group's release is official
+        //   items   [{ i: id, n: number, u: url suffix, g: group index,
+        //              v: volume?, t: name?, c: epoch seconds?, d: relative date? }]
         private val CHAPTER_SCRIPT = """
             (async () => {
-                // Measured from navigation start so we always hand back what we
-                // have before the Kotlin-side interception timeout tears the
-                // WebView down and we end up with nothing at all.
-                const deadline = Date.now() + Math.max(
-                    8000,
-                    $CHAPTER_SCRIPT_BUDGET_MS - performance.now()
-                );
-                const timeLeft = () => Date.now() < deadline;
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
                 const byId = new Map();
                 const fromPayload = new Set();
+
+                // Waits for the page to do something, rather than against an
+                // overall budget: a long series may take as many pages as it
+                // takes, we only bail when nothing moves for a whole stall.
+                const waitFor = async (predicate) => {
+                    const until = Date.now() + $CHAPTER_STALL_MS;
+                    while (Date.now() < until) {
+                        if (predicate()) return true;
+                        await sleep(100);
+                    }
+                    return false;
+                };
 
                 const text = (root, selector) => {
                     const node = root.querySelector(selector);
@@ -911,7 +937,6 @@ internal class Comix(context: MangaLoaderContext) :
                                 groupName: group && group.name ? group.name :
                                     (ch.isOfficial ? 'Official' : null),
                                 official: !!ch.isOfficial,
-                                votes: typeof ch.votes === 'number' ? ch.votes : 0,
                                 createdAt: typeof ch.createdAt === 'number' ? ch.createdAt : null,
                                 date: ch.createdAtFormatted || null
                             }, true);
@@ -968,7 +993,6 @@ internal class Comix(context: MangaLoaderContext) :
                             groupId: groupId ? Number(groupId[1]) : null,
                             groupName: groupName || null,
                             official: !!(groupNode && groupNode.classList.contains('is-official')),
-                            votes: number(text(row, '.mchap-row__likes')) || 0,
                             createdAt: null,
                             date: text(row, '.mchap-row__time') || null
                         }, false);
@@ -980,6 +1004,11 @@ internal class Comix(context: MangaLoaderContext) :
                 // `.mchap-foot__hint` reads "Showing 21 to 40 of 300 items", so it
                 // is both the progress marker and the signal that a click landed.
                 const hint = () => text(document, '.mchap-foot__hint');
+                const isComplete = () => {
+                    const match = /Showing\s+[\d,]+\s+to\s+([\d,]+)\s+of\s+([\d,]+)/i.exec(hint());
+                    if (!match) return false;
+                    return Number(match[1].replace(/,/g, '')) >= Number(match[2].replace(/,/g, ''));
+                };
                 const nextButton = () => {
                     const buttons = document.querySelectorAll('.mchap-foot .npager button');
                     for (const button of buttons) {
@@ -992,32 +1021,64 @@ internal class Comix(context: MangaLoaderContext) :
                 const isEmptyState = () => !!document.querySelector('.mpage__chapters .uempty');
                 const hasRows = () => !!document.querySelector('.mchap-list .mchap-item');
 
-                while (timeLeft() && !hasRows() && !isEmptyState()) await sleep(100);
+                await waitFor(() => hasRows() || isEmptyState());
                 scrape();
 
-                // The result travels back as a URL fragment, so cap how much we
-                // collect rather than risk building a URL the WebView drops.
-                for (let guard = 0; timeLeft() && guard < 500 && byId.size < 4000; guard++) {
+                while (!isComplete()) {
                     const button = nextButton();
                     if (!button) break;
                     const before = hint();
                     button.click();
-                    let advanced = false;
-                    while (timeLeft()) {
-                        await sleep(100);
-                        if (hint() !== before) { advanced = true; break; }
-                    }
-                    if (!advanced) break;
+                    if (!await waitFor(() => hint() !== before)) break;
                     scrape();
                 }
 
+                // --- Compact the result for the fragment-URL trip back. ---
+                const collected = [...byId.values()];
+                let prefix = collected.length ? String(collected[0].url || '') : '';
+                for (const chapter of collected) {
+                    const url = String(chapter.url || '');
+                    let i = 0;
+                    while (i < prefix.length && i < url.length && prefix[i] === url[i]) i++;
+                    prefix = prefix.slice(0, i);
+                }
+
+                const groups = [];
+                const groupIndex = new Map();
+                const items = collected.map((chapter) => {
+                    const official = chapter.official ? 1 : 0;
+                    const key = (chapter.groupId != null ? 'i' + chapter.groupId : 'n' + (chapter.groupName || '')) +
+                        '|' + official;
+                    let g = groupIndex.get(key);
+                    if (g === undefined) {
+                        g = groups.length;
+                        groupIndex.set(key, g);
+                        const entry = { o: official };
+                        if (chapter.groupId != null) entry.id = chapter.groupId;
+                        if (chapter.groupName) entry.name = chapter.groupName;
+                        groups.push(entry);
+                    }
+                    const row = {
+                        i: chapter.id,
+                        n: chapter.number,
+                        u: String(chapter.url || '').slice(prefix.length),
+                        g: g
+                    };
+                    if (chapter.volume != null) row.v = chapter.volume;
+                    if (chapter.name) row.t = chapter.name;
+                    if (chapter.createdAt != null) row.c = chapter.createdAt;
+                    else if (chapter.date) row.d = chapter.date;
+                    return row;
+                });
+
                 return JSON.stringify({
-                    items: [...byId.values()],
-                    empty: byId.size === 0 && isEmptyState()
+                    prefix: prefix,
+                    groups: groups,
+                    items: items,
+                    empty: items.length === 0 && isEmptyState()
                 });
             })()
         """
-
 
         // Browse results arrive via a signed, encrypted XHR the page decrypts in
         // JS, so we hook `JSON.parse` (catches the decrypted object), `fetch` and

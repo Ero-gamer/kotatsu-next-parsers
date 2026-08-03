@@ -30,6 +30,31 @@ internal abstract class MangaPlusParser(
 	private val apiUrl = "https://jumpg-webapi.tokyo-cdn.com/api"
 	override val configKeyDomain = ConfigKey.Domain("mangaplus.shueisha.co.jp")
 
+	private companion object {
+		private const val HEADER_VIEW_TOKEN = "Plus-Vw-Token"
+		private const val FRAGMENT_KEY = "key"
+		private const val FRAGMENT_TOKEN = "vt"
+		private const val DEFAULT_TITLE_TYPE = "serializing"
+	}
+
+	/**
+	 * The newer endpoints take the short form of the language in `lang`/`clang`,
+	 * while the payloads keep naming it with the long enum form.
+	 */
+	private val langCode: String
+		get() = when (sourceLang) {
+			"ENGLISH" -> "eng"
+			"SPANISH" -> "esp"
+			"FRENCH" -> "fra"
+			"INDONESIAN" -> "ind"
+			"PORTUGUESE_BR" -> "ptb"
+			"RUSSIAN" -> "rus"
+			"THAI" -> "tha"
+			"VIETNAMESE" -> "vie"
+			"GERMAN" -> "deu"
+			else -> "eng"
+		}
+
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
@@ -44,14 +69,52 @@ internal abstract class MangaPlusParser(
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(
 			isSearchSupported = true,
+			isSearchWithFiltersSupported = true,
+			// TAG is only ever handed to a parser through this flag; the site
+			// itself narrows by one genre at a time, so extras are ignored.
+			isMultipleTagsSupported = true,
 		)
 
-	override suspend fun getFilterOptions() = MangaListFilterOptions()
+	override suspend fun getFilterOptions() = MangaListFilterOptions(
+		availableTags = runCatchingCancellable { allTitlesV3Cache.get().second }
+			.getOrDefault(emptySet()),
+	)
+
+	/**
+	 * `all_v3` is the only endpoint that reports genres. It returns both the
+	 * catalogue of tags and, per title, the genres it belongs to.
+	 */
+	private val allTitlesV3Cache = suspendLazy {
+		val json = apiCall("/title_list/all_v3?type=$DEFAULT_TITLE_TYPE&lang=$langCode&clang=$langCode")
+			.getJSONObject("allTitlesViewV3")
+
+		val tags = json.optJSONArray("tags")?.asTypedList<JSONObject>().orEmpty()
+			.mapNotNullTo(LinkedHashSet()) { tag ->
+				val slug = tag.getStringOrNull("slug")?.nullIfEmpty() ?: return@mapNotNullTo null
+				val name = tag.getStringOrNull("name")?.nullIfEmpty() ?: return@mapNotNullTo null
+				MangaTag(key = slug, title = name, source = source)
+			}
+		val entries = json.optJSONArray("titles")?.asTypedList<JSONObject>().orEmpty()
+		entries to tags
+	}
+
+	private suspend fun getListByTag(tags: Set<MangaTag>, query: String?): List<Manga> {
+		val slugs = tags.mapTo(HashSet(tags.size)) { it.key }
+		return allTitlesV3Cache.get().first
+			.filter { entry ->
+				entry.optJSONArray("genres")?.asTypedList<JSONObject>().orEmpty()
+					.any { it.getStringOrNull("slug") in slugs }
+			}
+			.mapNotNull { it.optJSONObject("title") }
+			.toMangaList(query)
+	}
 
 	private val extraHeaders = Headers.headersOf("Session-Token", UUID.randomUUID().toString())
 
 	override suspend fun getList(order: SortOrder, filter: MangaListFilter): List<Manga> {
 		return when {
+			filter.tags.isNotEmpty() -> getListByTag(filter.tags, filter.query)
+
 			filter.query.isNullOrEmpty() -> {
 				when (order) {
 					SortOrder.POPULARITY -> getPopularList()
@@ -65,31 +128,51 @@ internal abstract class MangaPlusParser(
 	}
 
 	private suspend fun getPopularList(): List<Manga> {
-		val json = apiCall("/title_list/ranking")
+		val json = apiCall("/title_list/rankingV2?lang=$langCode&type=hottest&clang=$langCode")
 
+		// Ranked titles arrive grouped into chart sections rather than as one
+		// flat list, and each section repeats a work in every language.
 		return json.getJSONObject("titleRankingView")
-			.getJSONArray("titles")
-			.asTypedList<JSONObject>()
+			.getJSONArray("rankedTitles")
+			.mapJSON { it.optJSONArray("titles")?.asTypedList<JSONObject>().orEmpty() }
+			.flatten()
 			.toMangaList()
 	}
 
 	private suspend fun getLatestList(): List<Manga> {
-		val json = apiCall("/title_list/updated")
+		val json = apiCall("/web/web_homeV4?lang=$langCode&clang=$langCode")
 
-		return json.getJSONObject("titleUpdatedView")
-			.getJSONArray("latestTitle")
-			.mapJSON { it.getJSONObject("title") }
+		val latestTitles = json.getJSONObject("webHomeView")
+			.getJSONArray("groups")
+			.mapJSON { it.optJSONArray("titles")?.asTypedList<JSONObject>().orEmpty() }
+			.flatten()
+			.mapNotNull { it.optJSONObject("latestChapter")?.optJSONObject("title") }
+
+		// The home feed reports whichever language published the update, so each
+		// work is traced back through the all-titles groups — a group holds the
+		// same work in every language — to the edition this source reads.
+		val groups = allTitleGroupsCache.get()
+		return latestTitles.mapNotNull { latest ->
+			val titleId = latest.optInt("titleId", 0)
+			groups.firstOrNull { group -> group.any { it.optInt("titleId", 0) == titleId } }
+				?.firstOrNull { it.getStringOrNull("language").orDefaultLang() == sourceLang }
+		}.distinctBy { it.optInt("titleId", 0) }
 			.toMangaList()
 	}
 
 	// since search is local, save network calls on related manga call
-	private val allTitleCache = suspendLazy {
+	private val allTitleGroupsCache = suspendLazy {
 		apiCall("/title_list/allV2")
 			.getJSONObject("allTitlesViewV2")
 			.getJSONArray("AllTitlesGroup")
-			.mapJSON { it.getJSONArray("titles").asTypedList<JSONObject>() }
-			.flatten()
+			.mapJSON { it.optJSONArray("titles")?.asTypedList<JSONObject>().orEmpty() }
 	}
+
+	private val allTitleCache = suspendLazy {
+		allTitleGroupsCache.get().flatten()
+	}
+
+	private fun String?.orDefaultLang(): String = this ?: "ENGLISH"
 
 	private suspend fun getAllTitleList(query: String? = null): List<Manga> {
 		return allTitleCache.get().toMangaList(query)
@@ -133,7 +216,7 @@ internal abstract class MangaPlusParser(
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val json = apiCall("/title_detailV3?title_id=${manga.url}")
+		val json = apiCall("/title_detailV3?title_id=${manga.url}&clang=$langCode")
 			.getJSONObject("titleDetailView")
 		val title = json.getJSONObject("title")
 
@@ -201,9 +284,13 @@ internal abstract class MangaPlusParser(
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val pages = apiCall("/manga_viewer?chapter_id=${chapter.url}&split=yes&img_quality=super_high")
-			.getJSONObject("mangaViewer")
-			.getJSONArray("pages")
+		val mangaViewer = apiCall(
+			"/manga_viewer_v3?chapter_id=${chapter.url}&split=yes&img_quality=super_high&clang=$langCode",
+		).getJSONObject("mangaViewer")
+		val pages = mangaViewer.getJSONArray("pages")
+		// Images are served only to the viewer session that requested them; the
+		// token has to travel back out as a request header (see [intercept]).
+		val viewToken = mangaViewer.getStringOrNull("viewToken")
 
 		return pages.mapJSONNotNull {
 			val mangaPage = it.optJSONObject("mangaPage")
@@ -212,19 +299,57 @@ internal abstract class MangaPlusParser(
 			val encryptionKey = mangaPage.getStringOrNull("encryptionKey")
 			MangaPage(
 				id = generateUid(url),
-				url = url + if (encryptionKey == null) "" else "#$encryptionKey",
+				url = url + buildPageFragment(encryptionKey, viewToken),
 				preview = null,
 				source = source,
 			)
 		}
 	}
 
+	/**
+	 * Both values ride along in the fragment, which is never sent to the server.
+	 * A fragment holding nothing but hex is still read as a bare encryption key
+	 * so pages stored before the token existed keep working.
+	 */
+	private fun buildPageFragment(encryptionKey: String?, viewToken: String?): String {
+		val parts = buildList {
+			encryptionKey?.let { add("$FRAGMENT_KEY=$it") }
+			viewToken?.nullIfEmpty()?.let { add("$FRAGMENT_TOKEN=${it.urlEncoded()}") }
+		}
+		return if (parts.isEmpty()) "" else "#" + parts.joinToString("&")
+	}
+
+	private fun String.fragmentValue(name: String): String? {
+		if ('=' !in this) {
+			return if (name == FRAGMENT_KEY) this else null
+		}
+		return split('&')
+			.map { it.split('=', limit = 2) }
+			.firstOrNull { it.size == 2 && it[0] == name }
+			?.get(1)
+			?.urlDecode()
+			?.nullIfEmpty()
+	}
+
 	// image descrambling
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
-		val response = chain.proceed(request)
-		val encryptionKey = request.url.fragment
+		val fragment = request.url.fragment
 
+		if (fragment.isNullOrEmpty()) {
+			return chain.proceed(request)
+		}
+
+		val viewToken = fragment.fragmentValue(FRAGMENT_TOKEN)
+		val response = chain.proceed(
+			if (viewToken != null) {
+				request.newBuilder().header(HEADER_VIEW_TOKEN, viewToken).build()
+			} else {
+				request
+			},
+		)
+
+		val encryptionKey = fragment.fragmentValue(FRAGMENT_KEY)
 		if (encryptionKey.isNullOrEmpty()) {
 			return response
 		}
