@@ -13,7 +13,10 @@ import org.koitharu.kotatsu.parsers.util.nullIfEmpty
 
 @MangaSourceParser("RAVENSCANS", "RavenScans", "en")
 internal class RavenScans(context: MangaLoaderContext) :
-	MangaReaderParser(context, MangaParserSource.RAVENSCANS, "ravenscans.org", pageSize = 10, searchPageSize = 10) {
+	// Must be .net: the old .org host 301s everything across and rewrites
+	// /series into /manga on the way, which .net then answers with a 404 — so
+	// going through it defeats the listUrl below no matter what it is set to.
+	MangaReaderParser(context, MangaParserSource.RAVENSCANS, "ravenscans.net", pageSize = 10, searchPageSize = 10) {
 	// The site lists and links titles under /series; /manga is a 404 here.
 	override val listUrl = "/series"
 	override val datePattern = "MMM d, yyyy"

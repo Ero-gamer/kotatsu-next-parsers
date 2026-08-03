@@ -881,14 +881,17 @@ internal class Comix(context: MangaLoaderContext) :
         private val CHAPTER_SCRIPT = """
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                // A page turn is quick; only the initial render gets the full
+                // stall allowance.
+                const CLICK_TIMEOUT = 15000;
                 const byId = new Map();
                 const fromPayload = new Set();
 
                 // Waits for the page to do something, rather than against an
                 // overall budget: a long series may take as many pages as it
                 // takes, we only bail when nothing moves for a whole stall.
-                const waitFor = async (predicate) => {
-                    const until = Date.now() + $CHAPTER_STALL_MS;
+                const waitFor = async (predicate, timeout) => {
+                    const until = Date.now() + (timeout || $CHAPTER_STALL_MS);
                     while (Date.now() < until) {
                         if (predicate()) return true;
                         await sleep(100);
@@ -976,7 +979,11 @@ internal class Comix(context: MangaLoaderContext) :
                         const link = row.querySelector('a.mchap-row__primary');
                         const href = link ? link.getAttribute('href') : null;
                         if (!href) continue;
-                        const idMatch = /\/(\d+)-/.exec(href);
+                        // The id leads the last path segment; matching it
+                        // anywhere would pick up a title slug that starts with
+                        // digits instead, collapsing every chapter into one.
+                        const slug = href.split('?')[0].split('/').filter(Boolean).pop() || '';
+                        const idMatch = /^(\d+)-/.exec(slug);
                         if (!idMatch) continue;
                         const groupLink = row.querySelector('a.mchap-row__group');
                         const groupNode = groupLink || row.querySelector('.mchap-row__group');
@@ -1018,19 +1025,81 @@ internal class Comix(context: MangaLoaderContext) :
                     }
                     return null;
                 };
+                const firstButton = () => {
+                    const buttons = document.querySelectorAll('.mchap-foot .npager button');
+                    for (const button of buttons) {
+                        if (button.disabled) continue;
+                        const label = button.getAttribute('aria-label') || '';
+                        if (/first/i.test(label)) return button;
+                    }
+                    return null;
+                };
+                const total = () => {
+                    const match = /of\s+([\d,]+)\s+items/i.exec(hint());
+                    return match ? Number(match[1].replace(/,/g, '')) : 0;
+                };
                 const isEmptyState = () => !!document.querySelector('.mpage__chapters .uempty');
                 const hasRows = () => !!document.querySelector('.mchap-list .mchap-item');
 
-                await waitFor(() => hasRows() || isEmptyState());
-                scrape();
+                // Identifies which rows are on screen, so a page is only read
+                // once it has stopped changing — scraping the instant the first
+                // row appears can catch a half-rendered list.
+                const rowSignature = () => {
+                    const rows = document.querySelectorAll('.mchap-list .mchap-item a.mchap-row__primary');
+                    let signature = rows.length + ':';
+                    for (const row of rows) signature += (row.getAttribute('href') || '') + ',';
+                    return signature;
+                };
+                const settle = async () => {
+                    let previous = null;
+                    for (let i = 0; i < 100; i++) {
+                        const current = rowSignature();
+                        if (previous !== null && current === previous) return;
+                        previous = current;
+                        await sleep(100);
+                    }
+                };
 
-                while (!isComplete()) {
-                    const button = nextButton();
-                    if (!button) break;
-                    const before = hint();
-                    button.click();
-                    if (!await waitFor(() => hint() !== before)) break;
-                    scrape();
+                const walk = async () => {
+                    while (!isComplete()) {
+                        const button = nextButton();
+                        if (!button) break;
+                        const before = hint();
+                        // Read the page being left as well, so a click that
+                        // lands late cannot cost the rows already on screen.
+                        scrape();
+                        button.click();
+                        // A click that does not register would otherwise cost a
+                        // whole page, so give it one more go before bailing out.
+                        if (!await waitFor(() => hint() !== before, CLICK_TIMEOUT)) {
+                            const retry = nextButton();
+                            if (!retry) break;
+                            retry.click();
+                            if (!await waitFor(() => hint() !== before, CLICK_TIMEOUT)) break;
+                        }
+                        await settle();
+                        scrape();
+                    }
+                };
+
+                await waitFor(() => hasRows() || isEmptyState());
+                await settle();
+                scrape();
+                await walk();
+
+                // The site reports how many chapters exist, so a short result
+                // means a click never landed and a whole page was skipped.
+                // Rewinding and walking once more recovers it.
+                const expected = total();
+                if (expected > 0 && byId.size < expected) {
+                    const first = firstButton();
+                    if (first) {
+                        first.click();
+                        await waitFor(() => /Showing\s+1\s+to/i.test(hint()));
+                        await settle();
+                        scrape();
+                        await walk();
+                    }
                 }
 
                 // --- Compact the result for the fragment-URL trip back. ---

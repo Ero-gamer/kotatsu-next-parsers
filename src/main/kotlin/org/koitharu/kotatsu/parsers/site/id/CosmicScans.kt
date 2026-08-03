@@ -50,6 +50,9 @@ internal class CosmicScans(context: MangaLoaderContext) :
 			isSearchSupported = true,
 			isSearchWithFiltersSupported = true,
 			isMultipleTagsSupported = true,
+			// The search endpoint matches creator names as well as titles, so
+			// tapping an author resolves through the very same query.
+			isAuthorSearchSupported = true,
 		)
 
 	// The listing endpoint ignores every genre parameter spelling it was probed
@@ -79,7 +82,8 @@ internal class CosmicScans(context: MangaLoaderContext) :
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val wantedTags = filter.tags.mapTo(HashSet(filter.tags.size)) { it.title.lowercase(Locale.ENGLISH) }
-		val query = filter.query?.nullIfEmpty()
+		// An author lookup goes through the same keyword search.
+		val query = filter.query?.nullIfEmpty() ?: filter.author?.nullIfEmpty()
 
 		if (query != null) {
 			// The search endpoint answers with every match at once, uncursored.
@@ -174,11 +178,16 @@ internal class CosmicScans(context: MangaLoaderContext) :
 			if (item.optString("redirect_link").nullIfEmpty() != null) {
 				return@mapJSONNotNull null
 			}
-			val number = item.optString("chapterNum")
+			// A number is often decorated ("576 FIX", "530.5 HBD", "515 V2"),
+			// so take the leading value rather than parsing the whole string —
+			// otherwise every decorated chapter lands on 0 and they collapse
+			// into one another below.
+			val numberText = item.optString("chapterNum")
+			val number = CHAPTER_NUMBER_REGEX.find(numberText)?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
 			MangaChapter(
 				id = generateUid(chapterSlug),
-				title = number.nullIfEmpty()?.let { "Chapter $it" },
-				number = number.toFloatOrNull() ?: 0f,
+				title = numberText.nullIfEmpty()?.let { "Chapter $it" },
+				number = number,
 				volume = 0,
 				url = "/chapter/$chapterSlug",
 				scanlator = null,
@@ -189,10 +198,16 @@ internal class CosmicScans(context: MangaLoaderContext) :
 		}
 			// The site hosts some chapters twice under a zero-padded slug as
 			// well ("chapter-3" and "chapter-03"), which would otherwise show up
-			// as two entries with the same number.
-			?.groupBy { it.number }
-			?.map { (_, duplicates) -> duplicates.maxBy { it.uploadDate } }
-			?.sortedBy { it.number }
+			// as two entries with the same number. Only numbered chapters are
+			// collapsed; anything unnumbered stays as its own entry rather than
+			// being merged with every other unnumbered one.
+			?.let { parsed ->
+				val (numbered, unnumbered) = parsed.partition { it.number > 0f }
+				numbered.groupBy { it.number }
+					.map { (_, duplicates) -> duplicates.maxBy { it.uploadDate } }
+					.plus(unnumbered.distinctBy { it.url })
+					.sortedBy { it.number }
+			}
 			.orEmpty()
 
 		return manga.copy(
@@ -256,6 +271,9 @@ internal class CosmicScans(context: MangaLoaderContext) :
 
 	private companion object {
 		private const val MAX_FILTERED_REQUESTS = 5
+
+		/** Leading value of a chapter label such as "530.5 HBD". */
+		private val CHAPTER_NUMBER_REGEX = Regex("""^\s*(\d+(?:\.\d+)?)""")
 
 		// A curated subset: the api reports ~87 distinct genre strings, most of
 		// them one-off typos, weekday names or content types rather than genres.

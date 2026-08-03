@@ -297,7 +297,14 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 		val request = chain.request()
 		val response = chain.proceed(request)
 		val fragment = request.url.fragment
-		if (fragment.isNullOrEmpty() || !response.isSuccessful) {
+		// Only files marked `_s` are protected. A chapter mixes them with plain
+		// images — typically its first page — and those must be passed straight
+		// through: decrypting one turns a perfectly good image into noise.
+		if (
+			fragment.isNullOrEmpty() ||
+			!response.isSuccessful ||
+			!PROTECTED_IMAGE_REGEX.matches(request.url.pathSegments.last())
+		) {
 			return response
 		}
 		val parts = fragment.split(';')
@@ -580,6 +587,9 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 
 	private companion object {
 		private const val HEADER_READER_TOKEN = "X-Reader-Access-Token"
+
+		/** Protected pages are named `<hash>_s.<ext>`; everything else is plain. */
+		private val PROTECTED_IMAGE_REGEX = Regex(""".*_s\.[^.]+$""")
 
 		// Scheme markers on the encrypted payload: 0xFF02 AES-CTR,
 		// 0xFF03 ChaCha20, 0xFF04 AES-CTR with a separate key derivation.
