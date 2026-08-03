@@ -10,6 +10,7 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNull
 import java.text.SimpleDateFormat
 import java.util.EnumSet
@@ -125,7 +126,7 @@ internal class CosmicScans(context: MangaLoaderContext) :
 			response.optJSONArray("data")
 				?.mapJSONNotNull { it.toManga() }
 				?.filterTo(result) { it.matches(wantedTags) }
-			cursor = response.optJSONObject("cursor")?.optString("nextCursor")?.nullIfEmpty()
+			cursor = response.optJSONObject("cursor")?.getStringOrNull("nextCursor")
 			requests++
 
 			// One api page per listing page unless genres thinned it out, in
@@ -142,24 +143,24 @@ internal class CosmicScans(context: MangaLoaderContext) :
 		wantedTags.all { wanted -> tags.any { it.title.lowercase(Locale.ENGLISH) == wanted } }
 
 	private fun JSONObject.toManga(): Manga? {
-		val slug = optString("slug").nullIfEmpty() ?: return null
-		val title = optString("title").nullIfEmpty() ?: return null
+		val slug = getStringOrNull("slug") ?: return null
+		val title = getStringOrNull("title") ?: return null
 		return Manga(
 			id = generateUid(slug),
 			url = "/series/$slug",
 			publicUrl = "https://$domain/series/$slug",
 			title = title,
 			altTitles = emptySet(),
-			coverUrl = optString("cover").nullIfEmpty(),
+			coverUrl = getStringOrNull("cover"),
 			// `big_cover` is null for every entry the api returns, so without a
 			// fallback the details screen is handed nothing at all even when the
 			// regular cover is perfectly good.
-			largeCoverUrl = optString("big_cover").nullIfEmpty() ?: optString("cover").nullIfEmpty(),
-			authors = setOfNotNull(optString("author").nullIfEmpty()),
-			description = optString("sinopsis").nullIfEmpty(),
+			largeCoverUrl = getStringOrNull("big_cover") ?: getStringOrNull("cover"),
+			authors = setOfNotNull(getStringOrNull("author").realName()),
+			description = getStringOrNull("sinopsis"),
 			tags = optJSONArray("genres").toTags() + optJSONArray("genre").toTags(),
-			state = parseState(optString("status")),
-			rating = optString("rating").toFloatOrNull()?.div(10f) ?: RATING_UNKNOWN,
+			state = parseState(getStringOrNull("status")),
+			rating = getStringOrNull("rating")?.toFloatOrNull()?.div(10f) ?: RATING_UNKNOWN,
 			contentRating = null,
 			source = source,
 		)
@@ -182,16 +183,16 @@ internal class CosmicScans(context: MangaLoaderContext) :
 		val seenSlugs = HashSet<String>()
 		// Listed newest first; Kotatsu expects the opposite.
 		val chapters = data.optJSONArray("chapters")?.mapJSONNotNull { item ->
-			val chapterSlug = item.optString("slug").nullIfEmpty() ?: return@mapJSONNotNull null
+			val chapterSlug = item.getStringOrNull("slug") ?: return@mapJSONNotNull null
 			// Entries pointing somewhere else are not readable through the API.
-			if (item.optString("redirect_link").nullIfEmpty() != null) {
+			if (item.getStringOrNull("redirect_link") != null) {
 				return@mapJSONNotNull null
 			}
 			// A number is often decorated ("576 FIX", "530.5 HBD", "515 V2"),
 			// so take the leading value rather than parsing the whole string —
 			// otherwise every decorated chapter lands on 0 and they collapse
 			// into one another below.
-			val numberText = item.optString("chapterNum")
+			val numberText = item.getStringOrNull("chapterNum").orEmpty()
 			val number = CHAPTER_NUMBER_REGEX.find(numberText)?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
 			if (!seenSlugs.add(chapterSlug)) {
 				return@mapJSONNotNull null
@@ -203,7 +204,7 @@ internal class CosmicScans(context: MangaLoaderContext) :
 				volume = 0,
 				url = "/chapter/$chapterSlug",
 				scanlator = null,
-				uploadDate = dateFormat.parseSafe(item.optString("time")),
+				uploadDate = dateFormat.parseSafe(item.getStringOrNull("time")),
 				branch = null,
 				source = source,
 			)
@@ -212,21 +213,21 @@ internal class CosmicScans(context: MangaLoaderContext) :
 			.orEmpty()
 
 		return manga.copy(
-			title = data.optString("title").nullIfEmpty() ?: manga.title,
-			coverUrl = data.optString("cover").nullIfEmpty() ?: manga.coverUrl,
-			largeCoverUrl = data.optString("big_cover").nullIfEmpty()
-				?: data.optString("cover").nullIfEmpty()
+			title = data.getStringOrNull("title") ?: manga.title,
+			coverUrl = data.getStringOrNull("cover") ?: manga.coverUrl,
+			largeCoverUrl = data.getStringOrNull("big_cover")
+				?: data.getStringOrNull("cover")
 				?: manga.largeCoverUrl
 				?: manga.coverUrl,
-			description = data.optString("sinopsis").nullIfEmpty() ?: manga.description,
+			description = data.getStringOrNull("sinopsis") ?: manga.description,
 			authors = setOfNotNull(
-				data.optString("author").realName(),
-				data.optString("artist").realName(),
+				data.getStringOrNull("author").realName(),
+				data.getStringOrNull("artist").realName(),
 			).ifEmpty { manga.authors },
 			tags = (data.optJSONArray("genre").toTags() + data.optJSONArray("genres").toTags())
 				.ifEmpty { manga.tags },
-			state = parseState(data.optString("status")) ?: manga.state,
-			rating = data.optString("rating").toFloatOrNull()?.div(10f) ?: manga.rating,
+			state = parseState(data.getStringOrNull("status")) ?: manga.state,
+			rating = data.getStringOrNull("rating")?.toFloatOrNull()?.div(10f) ?: manga.rating,
 			chapters = chapters,
 		)
 	}
@@ -236,7 +237,7 @@ internal class CosmicScans(context: MangaLoaderContext) :
 		val data = webClient.httpGet("$apiUrl/readingPage/$slug", apiHeaders).parseJson()
 			.optJSONObject("data")
 			?: return emptyList()
-		if (data.optString("redirect_link").nullIfEmpty() != null) {
+		if (data.getStringOrNull("redirect_link") != null) {
 			return emptyList()
 		}
 		// Each entry is a small HTML snippet wrapping a single <img>.

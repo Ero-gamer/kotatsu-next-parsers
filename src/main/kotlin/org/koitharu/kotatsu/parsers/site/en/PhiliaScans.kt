@@ -17,6 +17,7 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNull
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -86,8 +87,8 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 		tagsCache?.let { return it }
 		val array = webClient.httpGet("$apiUrl/genres").parseJsonArray()
 		val tags = array.mapJSONNotNull { item ->
-			val key = item.optString("slug").nullIfEmpty() ?: return@mapJSONNotNull null
-			val title = item.optString("name").nullIfEmpty() ?: return@mapJSONNotNull null
+			val key = item.getStringOrNull("slug") ?: return@mapJSONNotNull null
+			val title = item.getStringOrNull("name") ?: return@mapJSONNotNull null
 			MangaTag(key = key, title = title, source = source)
 		}.toSet()
 		tagsCache = tags
@@ -130,22 +131,22 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 
 		val items = webClient.httpGet(url).parseJson().optJSONArray("items") ?: return emptyList()
 		return items.mapJSONNotNull { item ->
-			val slug = item.optString("slug").nullIfEmpty() ?: return@mapJSONNotNull null
+			val slug = item.getStringOrNull("slug") ?: return@mapJSONNotNull null
 			Manga(
 				id = generateUid(slug),
 				url = "/series/$slug",
 				publicUrl = "https://$domain/series/$slug",
-				title = item.optString("title").nullIfEmpty() ?: return@mapJSONNotNull null,
+				title = item.getStringOrNull("title") ?: return@mapJSONNotNull null,
 				altTitles = emptySet(),
 				// The API mixes absolute and root-relative media urls.
-				coverUrl = item.optString("coverImageUrl").nullIfEmpty()?.toAbsoluteUrl(domain),
+				coverUrl = item.getStringOrNull("coverImageUrl")?.toAbsoluteUrl(domain),
 				largeCoverUrl = null,
 				authors = emptySet(),
 				description = null,
 				tags = item.optJSONArray("genres")?.toTags().orEmpty(),
-				state = parseState(item.optString("status")),
-				rating = item.optString("ratingAvg").toFloatOrNull()?.div(10f) ?: RATING_UNKNOWN,
-				contentRating = parseContentRating(item.optString("contentRating")),
+				state = parseState(item.getStringOrNull("status")),
+				rating = item.getStringOrNull("ratingAvg")?.toFloatOrNull()?.div(10f) ?: RATING_UNKNOWN,
+				contentRating = parseContentRating(item.getStringOrNull("contentRating")),
 				source = source,
 			)
 		}
@@ -161,20 +162,20 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 			.parseChapters(slug)
 
 		return manga.copy(
-			title = details.optString("title").nullIfEmpty() ?: manga.title,
+			title = details.getStringOrNull("title") ?: manga.title,
 			altTitles = details.optJSONArray("alternativeTitles")?.let { array ->
 				(0 until array.length()).mapNotNullTo(LinkedHashSet()) { array.optString(it).nullIfEmpty() }
 			}.orEmpty(),
-			coverUrl = details.optString("coverImageUrl").nullIfEmpty()?.toAbsoluteUrl(domain)
+			coverUrl = details.getStringOrNull("coverImageUrl")?.toAbsoluteUrl(domain)
 				?: manga.coverUrl,
-			description = details.optString("synopsis").nullIfEmpty(),
+			description = details.getStringOrNull("synopsis"),
 			tags = details.optJSONArray("genres")?.toTags().orEmpty(),
 			authors = buildSet {
 				addAll(details.optJSONArray("authors").toNames())
 				addAll(details.optJSONArray("artists").toNames())
 			},
-			state = parseState(details.optString("status")),
-			contentRating = parseContentRating(details.optString("contentRating")),
+			state = parseState(details.getStringOrNull("status")),
+			contentRating = parseContentRating(details.getStringOrNull("contentRating")),
 			chapters = chapters,
 		)
 	}
@@ -186,11 +187,11 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 		}
 		// The API lists newest first; Kotatsu wants oldest first.
 		return mapJSONNotNull { item ->
-			val slug = item.optString("slug").nullIfEmpty() ?: return@mapJSONNotNull null
+			val slug = item.getStringOrNull("slug") ?: return@mapJSONNotNull null
 			val number = item.optString("number")
 			// A chapter that costs coins and has not been bought cannot be read.
 			val isLocked = !item.optBoolean("purchased") && item.optInt("coinPrice") != 0
-			val rawTitle = item.optString("title").nullIfEmpty()
+			val rawTitle = item.getStringOrNull("title")
 				?.takeIf { it != "null" && it != number }
 			val name = if (rawTitle != null) "Chapter $number - $rawTitle" else "Chapter $number"
 			MangaChapter(
@@ -249,8 +250,8 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 		if (keys.optBoolean("sessionDefault")) {
 			val open = webClient.httpPost("$apiUrl/chapters/$chapterId/open".toHttpUrl(), JSONObject(), headers)
 				.parseJson()
-			payloadA = open.optString("payloadA").nullIfEmpty()
-			val sessionId = open.optString("sessionId").nullIfEmpty()
+			payloadA = open.getStringOrNull("payloadA")
+			val sessionId = open.getStringOrNull("sessionId")
 			if (sessionId != null) {
 				payloadB = runCatchingCancellable {
 					webClient.httpGet("$apiUrl/chapters/$chapterId/get-drm?session=$sessionId", headers)
@@ -269,7 +270,7 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 				// carried in the fragment so it never reaches the server.
 				val fragment = listOf(
 					if (isScrambled) "1" else "0",
-					page.optString("mime").nullIfEmpty() ?: "image/webp",
+					page.getStringOrNull("mime") ?: "image/webp",
 					chapterKeyB64,
 					gridSize.toString(),
 					payloadA.orEmpty(),
@@ -544,14 +545,14 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 		.build()
 
 	private fun JSONArray.toTags(): Set<MangaTag> = mapJSONNotNull { item ->
-		val key = item.optString("slug").nullIfEmpty() ?: return@mapJSONNotNull null
-		val title = item.optString("name").nullIfEmpty() ?: return@mapJSONNotNull null
+		val key = item.getStringOrNull("slug") ?: return@mapJSONNotNull null
+		val title = item.getStringOrNull("name") ?: return@mapJSONNotNull null
 		MangaTag(key = key, title = title, source = source)
 	}.toSet()
 
 	private fun JSONArray?.toNames(): Set<String> {
 		if (this == null) return emptySet()
-		return mapJSONNotNull { it.optString("name").nullIfEmpty() }.toSet()
+		return mapJSONNotNull { it.getStringOrNull("name") }.toSet()
 	}
 
 	private fun parseState(value: String?): MangaState? = when (value?.uppercase(Locale.ROOT)) {
