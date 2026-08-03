@@ -1016,8 +1016,33 @@ internal class Comix(context: MangaLoaderContext) :
                     if (!match) return false;
                     return Number(match[1].replace(/,/g, '')) >= Number(match[2].replace(/,/g, ''));
                 };
+                const currentPage = () => {
+                    const active = document.querySelector('.mchap-foot .npager button.npager__num.is-active');
+                    const marked = active ? Number((active.textContent || '').trim()) : NaN;
+                    if (marked > 0) return marked;
+                    const match = /Showing\s+([\d,]+)\s+to\s+([\d,]+)/i.exec(hint());
+                    if (!match) return 1;
+                    const from = Number(match[1].replace(/,/g, ''));
+                    const to = Number(match[2].replace(/,/g, ''));
+                    const size = to - from + 1;
+                    return size > 0 ? Math.floor((from - 1) / size) + 1 : 1;
+                };
+
+                /**
+                 * The pager only draws its Next arrow while the numeric window
+                 * has not yet reached the final page, so Next is already gone on
+                 * the second-to-last page — and on every series short enough to
+                 * fit the whole window, it never appears at all. The numbered
+                 * button for the following page is always on screen though, so
+                 * paging by number is what actually reaches the end.
+                 */
                 const nextButton = () => {
                     const buttons = document.querySelectorAll('.mchap-foot .npager button');
+                    const wanted = currentPage() + 1;
+                    for (const button of buttons) {
+                        if (button.disabled) continue;
+                        if (Number((button.textContent || '').trim()) === wanted) return button;
+                    }
                     for (const button of buttons) {
                         if (button.disabled) continue;
                         const label = button.getAttribute('aria-label') || '';

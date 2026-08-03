@@ -253,8 +253,12 @@ internal abstract class MangaPlusParser(
 	}
 
 	private fun parseChapters(chapterListGroup: List<ProtoMessage>): List<MangaChapter> {
+		// A group splits its chapters across three lists — first (2), middle (3)
+		// and last (4) — and the outer two are capped at three entries each.
+		// Reading only those caps every title at six chapters and silently drops
+		// everything the middle list holds.
 		return chapterListGroup
-			.flatMap { it.messages(2) + it.messages(4) }
+			.flatMap { it.messages(2) + it.messages(3) + it.messages(4) }
 			.mapChapters { _, chapter ->
 				val chapterId = chapter.int(2)?.toString() ?: return@mapChapters null
 				// An expired chapter drops its subtitle and can no longer be read.

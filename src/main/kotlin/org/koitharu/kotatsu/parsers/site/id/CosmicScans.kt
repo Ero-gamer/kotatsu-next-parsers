@@ -151,7 +151,10 @@ internal class CosmicScans(context: MangaLoaderContext) :
 			title = title,
 			altTitles = emptySet(),
 			coverUrl = optString("cover").nullIfEmpty(),
-			largeCoverUrl = optString("big_cover").nullIfEmpty(),
+			// `big_cover` is null for every entry the api returns, so without a
+			// fallback the details screen is handed nothing at all even when the
+			// regular cover is perfectly good.
+			largeCoverUrl = optString("big_cover").nullIfEmpty() ?: optString("cover").nullIfEmpty(),
 			authors = setOfNotNull(optString("author").nullIfEmpty()),
 			description = optString("sinopsis").nullIfEmpty(),
 			tags = optJSONArray("genres").toTags() + optJSONArray("genre").toTags(),
@@ -171,6 +174,12 @@ internal class CosmicScans(context: MangaLoaderContext) :
 		val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
 			timeZone = TimeZone.getTimeZone("UTC")
 		}
+		// The api repeats some rows verbatim — the same slug listed twice — so
+		// only an identical slug is a real duplicate. Labels that merely look
+		// alike are separate chapters with their own pages: "90" and
+		// "90 s2 end" run 58 and 31 pages, and "9" and "09" were uploaded more
+		// than a year apart. Collapsing those by number would delete content.
+		val seenSlugs = HashSet<String>()
 		// Listed newest first; Kotatsu expects the opposite.
 		val chapters = data.optJSONArray("chapters")?.mapJSONNotNull { item ->
 			val chapterSlug = item.optString("slug").nullIfEmpty() ?: return@mapJSONNotNull null
@@ -184,6 +193,9 @@ internal class CosmicScans(context: MangaLoaderContext) :
 			// into one another below.
 			val numberText = item.optString("chapterNum")
 			val number = CHAPTER_NUMBER_REGEX.find(numberText)?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
+			if (!seenSlugs.add(chapterSlug)) {
+				return@mapJSONNotNull null
+			}
 			MangaChapter(
 				id = generateUid(chapterSlug),
 				title = numberText.nullIfEmpty()?.let { "Chapter $it" },
@@ -196,28 +208,20 @@ internal class CosmicScans(context: MangaLoaderContext) :
 				source = source,
 			)
 		}
-			// The site hosts some chapters twice under a zero-padded slug as
-			// well ("chapter-3" and "chapter-03"), which would otherwise show up
-			// as two entries with the same number. Only numbered chapters are
-			// collapsed; anything unnumbered stays as its own entry rather than
-			// being merged with every other unnumbered one.
-			?.let { parsed ->
-				val (numbered, unnumbered) = parsed.partition { it.number > 0f }
-				numbered.groupBy { it.number }
-					.map { (_, duplicates) -> duplicates.maxBy { it.uploadDate } }
-					.plus(unnumbered.distinctBy { it.url })
-					.sortedBy { it.number }
-			}
+			?.sortedBy { it.number }
 			.orEmpty()
 
 		return manga.copy(
 			title = data.optString("title").nullIfEmpty() ?: manga.title,
 			coverUrl = data.optString("cover").nullIfEmpty() ?: manga.coverUrl,
-			largeCoverUrl = data.optString("big_cover").nullIfEmpty() ?: manga.largeCoverUrl,
+			largeCoverUrl = data.optString("big_cover").nullIfEmpty()
+				?: data.optString("cover").nullIfEmpty()
+				?: manga.largeCoverUrl
+				?: manga.coverUrl,
 			description = data.optString("sinopsis").nullIfEmpty() ?: manga.description,
 			authors = setOfNotNull(
-				data.optString("author").nullIfEmpty(),
-				data.optString("artist").nullIfEmpty(),
+				data.optString("author").realName(),
+				data.optString("artist").realName(),
 			).ifEmpty { manga.authors },
 			tags = (data.optJSONArray("genre").toTags() + data.optJSONArray("genres").toTags())
 				.ifEmpty { manga.tags },
@@ -261,6 +265,10 @@ internal class CosmicScans(context: MangaLoaderContext) :
 		}
 	}
 
+	/** Creator fields carry placeholders like "-" when nobody is credited. */
+	private fun String?.realName(): String? = this?.trim()
+		?.takeIf { it.isNotEmpty() && it.lowercase(Locale.ENGLISH) !in CREATOR_PLACEHOLDERS }
+
 	private fun parseState(value: String?): MangaState? = when (value?.lowercase(Locale.ENGLISH)) {
 		"ongoing" -> MangaState.ONGOING
 		"completed", "complete" -> MangaState.FINISHED
@@ -274,6 +282,9 @@ internal class CosmicScans(context: MangaLoaderContext) :
 
 		/** Leading value of a chapter label such as "530.5 HBD". */
 		private val CHAPTER_NUMBER_REGEX = Regex("""^\s*(\d+(?:\.\d+)?)""")
+
+
+		private val CREATOR_PLACEHOLDERS = setOf("-", "--", "?", "n/a", "na", "unknown", "null")
 
 		// A curated subset: the api reports ~87 distinct genre strings, most of
 		// them one-off typos, weekday names or content types rather than genres.
