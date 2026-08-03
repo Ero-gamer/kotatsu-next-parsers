@@ -64,7 +64,8 @@ internal class DivascansParser(context: MangaLoaderContext) :
 		get() = MangaListFilterCapabilities(
 			isSearchSupported = true,
 			isSearchWithFiltersSupported = true,
-			isMultipleTagsSupported = false,
+			// API only accepts a single genre query; extra tags are AND-filtered client-side.
+			isMultipleTagsSupported = true,
 			// API has no exclude-genre param — applied client-side after fetch.
 			isTagsExclusionSupported = true,
 		)
@@ -94,7 +95,8 @@ internal class DivascansParser(context: MangaLoaderContext) :
 			.addQueryParameter("page", page.toString())
 			.addQueryParameter("limit", pageSize.toString())
 			.apply {
-				filter.tags.oneOrThrowIfMany()?.let { tag ->
+				// Server supports one genre param; remaining tags filtered in applyLocalFilters.
+				filter.tags.firstOrNull()?.let { tag ->
 					addQueryParameter("genre", tag.key)
 				}
 				filter.states.oneOrThrowIfMany()?.let { state ->
@@ -218,12 +220,19 @@ internal class DivascansParser(context: MangaLoaderContext) :
 			.toList()
 	}
 
-	/** Client-side filters the API does not honour (exclude tags). */
+	/**
+	 * Client-side filters the API does not fully honour:
+	 * - multiple include tags (AND — series must have every selected genre)
+	 * - exclude tags
+	 */
 	private fun applyLocalFilters(list: List<Manga>, filter: MangaListFilter): List<Manga> {
-		if (filter.tagsExclude.isEmpty()) return list
+		if (filter.tags.isEmpty() && filter.tagsExclude.isEmpty()) return list
+		val includeKeys = filter.tags.mapToSet { it.key }
 		val excludeKeys = filter.tagsExclude.mapToSet { it.key }
 		return list.filter { manga ->
-			manga.tags.none { tag -> tag.key in excludeKeys }
+			val mangaKeys = manga.tags.mapToSet { it.key }
+			(includeKeys.isEmpty() || includeKeys.all { it in mangaKeys }) &&
+				(excludeKeys.isEmpty() || mangaKeys.none { it in excludeKeys })
 		}
 	}
 
