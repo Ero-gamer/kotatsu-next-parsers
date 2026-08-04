@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.all
 
 import okhttp3.Interceptor
+import okhttp3.Request
 import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaParserAuthProvider
@@ -31,7 +32,9 @@ internal abstract class MangaFireParser(
     context: MangaLoaderContext,
     source: MangaParserSource,
     private val siteLang: String,
-) : PagedMangaParser(context, source, 30), Interceptor, MangaParserAuthProvider {
+    // Matches the `limit` sent to /api/titles, so the paginator's first guess
+    // for page 2 lines up with what the API actually returns.
+) : PagedMangaParser(context, source, 50), Interceptor, MangaParserAuthProvider {
 
     override val configKeyDomain = ConfigKey.Domain("mangafire.to")
 
@@ -53,10 +56,95 @@ internal abstract class MangaFireParser(
                     .header("Referer", "https://$domain/")
                     .header("Accept", "application/json")
                     .build()
-                chain.proceed(request)
+                chain.proceed(signApiRequest(request))
             }
             .build()
         OkHttpWebClient(newHttpClient, source)
+    }
+
+    /**
+     * Every `/api/` endpoint answers an unsigned request with `403 {"message":
+     * "Missing token."}`, so each call has to carry a `vrf` parameter.
+     *
+     * The signature is computed over a canonical form of the request: the path
+     * without its `/api` prefix, followed by the query sorted by parameter name
+     * with the *decoded* values, and with repeated `key[]` parameters expanded
+     * to `key[0]`, `key[1]`, … in the order they were added. The query is then
+     * re-emitted in that same sorted order alongside the signature.
+     */
+    private fun signApiRequest(request: Request): Request {
+        val url = request.url
+        if (!url.encodedPath.startsWith("/api/")) {
+            return request
+        }
+
+        // sortedBy is stable, so multiple values of one key keep their order.
+        val params = url.queryParameterNames
+            .flatMap { name -> url.queryParameterValues(name).map { name to it.orEmpty() } }
+            .sortedBy { it.first }
+
+        val canonical = buildString {
+            append(url.encodedPath.removePrefix("/api"))
+            if (params.isNotEmpty()) {
+                append('?')
+                var lastKey = ""
+                var index = 0
+                params.joinTo(this, "&") { (key, value) ->
+                    val indexedKey = if (key.endsWith("[]")) {
+                        if (lastKey != key) {
+                            index = 0
+                        }
+                        lastKey = key
+                        key.replace("[]", "[${index++}]")
+                    } else {
+                        key
+                    }
+                    "$indexedKey=$value"
+                }
+            }
+        }
+
+        val newUrl = url.newBuilder().query(null).apply {
+            params.forEach { (key, value) -> addQueryParameter(key, value) }
+            addQueryParameter("vrf", signVrf(canonical))
+        }.build()
+
+        return request.newBuilder().url(newUrl).build()
+    }
+
+    /** Three rounds of a keyed byte substitution, then base64url without padding. */
+    private fun signVrf(canonical: String): String {
+        var data = canonical.toByteArray(Charsets.UTF_8)
+        for ((table, key, iv) in vrfStages) {
+            data = vrfRound(data, table, key, iv)
+        }
+        return context.encodeBase64(data)
+            .replace('+', '-')
+            .replace('/', '_')
+            .trimEnd('=')
+    }
+
+    /**
+     * Each output byte is fed back in as the next byte's third operand, so the
+     * rounds are chained the same way a CBC-style stream would be.
+     */
+    private fun vrfRound(data: ByteArray, table: ByteArray, key: ByteArray, iv: Int): ByteArray {
+        val out = ByteArray(data.size)
+        var prev = iv
+        for (i in data.indices) {
+            val index = (data[i].toInt() xor key[i % key.size].toInt() xor prev) and 0xFF
+            prev = table[index].toInt() and 0xFF
+            out[i] = prev.toByte()
+        }
+        return out
+    }
+
+    private val vrfStages: List<Triple<ByteArray, ByteArray, Int>> by lazy {
+        listOf(
+            Triple(context.decodeBase64(VRF_TABLE_1), context.decodeBase64(VRF_KEY_1), 0x5A),
+            Triple(context.decodeBase64(VRF_TABLE_2), context.decodeBase64(VRF_KEY_2), 0x35),
+            Triple(context.decodeBase64(VRF_TABLE_3), context.decodeBase64(VRF_KEY_3), 0xBA),
+        )
     }
 
     override fun intercept(chain: Interceptor.Chain) = chain.proceed(
@@ -74,6 +162,20 @@ internal abstract class MangaFireParser(
     )
 
     companion object {
+        // Substitution tables (256 bytes each) and keys for the `vrf` signature,
+        // lifted verbatim from the site's own signing routine.
+        private const val VRF_TABLE_1 =
+            "yINlmUNho8VYJT+ibTIP+9ESiULpVEtMOoD6U6lRE0R/xwXo/Xp9NrUgC4cw/Lmo33vUyjUE40kUoEWIr/fxfNNcq2s79ShQ5NhNrFnJ4hXPwOu/SuXzIbuTQKGFvfm08E9jvCfqAtoDqvQq3dVWPQFmJjgvkISBeXY3BgANR+yVnjGbcxZ47d6kLNfZPIayTq3/YGySb1KuVZodWp/WGNAO5pfMcpaK53Hhs0allBszaMaxuouOwdxbwgxIw6YunSsXjI05Yi0j9j4eHKfSXR8Ifo/Od+8iamRfCXTyvm7NGRGYdcQ0ywcK/u6RXhrbcCm4t2eCtrDgQVecJGkQ+A=="
+        private const val VRF_KEY_1 = "0Ec58JOY3uBzJK9m3zqIOpdlF7UFiax9DmA="
+
+        private const val VRF_TABLE_2 =
+            "IUFltCxD3Oc2cwCgkJffthaOg9cgPUb0LgW6H/VtfcF0kc5F25t+aWj6JH9VOhOaY0rAFdUxlDnl5BLNvwEJvQtP5qcw7vdb/K+chnbwnspSHT8mz5lqwz41TezG0hkO06FTjJZhsyNuFLDpD2ZZxQj/QIRcF90zpmQ7Byu483WsQqUE0C342HL+JXngRB6fRzxRyVTaKu83h7UYTJ0QMt6ixFh6S3F8gqkKwrGTL3jHNBsD45UnifK8+RGtishQV2K3rujLKEkiZxpr2dYcudFW4oFsDKhad3CLBvuyTqsCo4B7mL5IKQ1vXo/MOOvq1I1d8ar9X6Ttu5KF4fZgiA=="
+        private const val VRF_KEY_2 = "AAdjb1iPY8CiDmq9H34tKTBF8a3oDQ=="
+
+        private const val VRF_TABLE_3 =
+            "NQHlu1/wVO5EmkwQymF810qqY2xG1k2obcas4Z9mCsPEIFl9pRIjFxbJ7ybMHbBckT5Ton85E0FOeHezbh/mjlEYpmpnlXOS8dgrqeq2KfxImTh1YK9y0PeMNhzA1OQzSY9brYOJq/l2QnE/hwOeZIhPixVSKIUlDb5vLcH6RWKxkIEMuP0bDwIqQ71AJJaEaMJL7A6YtyIwoRT+L5v4aZzodN/0+3nOGsfblFjgxSfPzVDjNFeNl5P26+kEC/8AHgdrpAbt3hHz3HrRN1Y6e+JHgF7ncFWnoF0y3THL1S71WgWGCa6KtSzTCCG58n68nTyj2T3Sshk7utqCtMi/ZQ=="
+        private const val VRF_KEY_3 = "DELOJgPsVaCcblDtTGMdHzM="
+
         val GENRE_MAP = mapOf(
             "Action" to "1",
             "Adult" to "268929",
@@ -160,6 +262,9 @@ internal abstract class MangaFireParser(
             .addPathSegments("api/titles")
             .addQueryParameter("page", page.toString())
             .addQueryParameter("limit", "50")
+            // Without this every language variant browses the whole catalogue,
+            // most of which has no chapters in that language at all.
+            .addQueryParameter("languages[]", siteLang)
 
         if (!filter.query.isNullOrBlank()) {
             urlBuilder.addQueryParameter("keyword", filter.query)
@@ -236,9 +341,12 @@ internal abstract class MangaFireParser(
             val slug = obj.optString("slug", null)
             val title = obj.getString("title")
             val poster = obj.optJSONObject("poster")
-            val cover = poster?.optString("large")
-                ?: poster?.optString("medium")
-                ?: poster?.optString("small") ?: ""
+            // optString returns "" (not null) for a missing key, so the elvis
+            // chain needs the emptiness check to actually fall through.
+            val cover = poster?.optString("large")?.takeIf { it.isNotEmpty() }
+                ?: poster?.optString("medium")?.takeIf { it.isNotEmpty() }
+                ?: poster?.optString("small")?.takeIf { it.isNotEmpty() }
+                ?: ""
             val urlPath = "/title/$hid${slug?.let { "-$it" } ?: ""}"
             mangas.add(
                 Manga(
@@ -276,9 +384,9 @@ internal abstract class MangaFireParser(
 
             val title = data.getString("title")
             val poster = data.optJSONObject("poster")
-            val cover = poster?.optString("large")
-                ?: poster?.optString("medium")
-                ?: poster?.optString("small")
+            val cover = poster?.optString("large")?.takeIf { it.isNotEmpty() }
+                ?: poster?.optString("medium")?.takeIf { it.isNotEmpty() }
+                ?: poster?.optString("small")?.takeIf { it.isNotEmpty() }
             val synopsisHtml = data.optString("synopsisHtml", null)
             val status = data.optString("status", null)
             val type = data.optString("type", null)

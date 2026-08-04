@@ -521,42 +521,52 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        val allChapters = loadAllChapters(hashId)
-        val parsed = (0 until allChapters.length()).map { allChapters.getJSONObject(it) }
+        val payload = loadAllChapters(hashId)
+        val rawItems = payload.optJSONArray("items") ?: return emptyList()
+        val parsed = (0 until rawItems.length()).mapNotNull { rawItems.optJSONObject(it) }
+        if (parsed.isEmpty()) {
+            return emptyList()
+        }
 
-        // Comix mixes many scanlation teams into one list, which is messy to read
-        // and full of duplicates. Pick the single most consistent team (best
-        // coverage of the whole range, present at both the newest and oldest
-        // chapters) and keep only its chapters, deduplicated per number.
-        val chosenTeam = selectConsistentTeamKey(parsed)
-        val chapters = parsed
-            .filter { chosenTeam == null || teamKeyOf(it) == chosenTeam }
-            .let(::dedupByNumber)
+        // The script sends the shared URL prefix and the group list once and has
+        // every chapter reference them by index — see [CHAPTER_SCRIPT].
+        val urlPrefix = payload.optString("prefix")
+        val groups = payload.optJSONArray("groups")
+
+        // Every scanlation team is kept: each one becomes its own branch, so the
+        // reader gets the site's full "All groups" list with a translation
+        // picker rather than a single team chosen for it.
+        //
+        // The site serves chapters newest-first and the capture script merges
+        // several pages, so order the list here instead of trusting either.
+        val chapters = parsed.sortedBy { it.optDouble("n", 0.0) }
 
         val chaptersBuilder = ChaptersListBuilder(chapters.size)
         for (chapterData in chapters) {
-            val chapterId = chapterData.getLong("id")
-            val number = chapterData.getDouble("number").toFloat()
-            val name = chapterData.optString("name", "").nullIfEmpty()
-            val scanlator = teamNameOf(chapterData)
+            val chapterId = chapterData.optLong("i")
+            val number = chapterData.optDouble("n", 0.0).toFloat()
+            val name = chapterData.optString("t").nullIfEmpty()
+            val scanlator = teamNameOf(groups?.optJSONObject(chapterData.optInt("g", -1)))
+            val label = number.toChapterUrlPart()
             val title = if (name != null) {
-                "Chapter $number: $name"
+                "Chapter $label: $name"
             } else {
-                "Chapter $number"
+                "Chapter $label"
             }
-            // Prefer the canonical path the API provides — it carries the full
-            // title slug (e.g. `/title/x0ynk-villains.../<id>-chapter-N`). The
-            // hashId-only path 404s in the reader.
-            val chapterUrl = chapterData.optString("url").nullIfEmpty()
-                ?: "/title/$hashId/$chapterId-chapter-${number.toChapterUrlPart()}"
+            // Prefer the canonical path the site itself links to — it carries the
+            // full title slug (e.g. `/title/x0ynk-villains.../<id>-chapter-N`).
+            // The hashId-only path 404s in the reader.
+            val chapterUrl = chapterData.optString("u").nullIfEmpty()
+                ?.let { urlPrefix + it }
+                ?: "/title/$hashId/$chapterId-chapter-$label"
             chaptersBuilder.add(
                 MangaChapter(
                     id = generateUid("$scanlator-$chapterId"),
                     title = title,
                     number = number,
-                    volume = 0,
+                    volume = chapterData.optIntOrNull("v")?.coerceAtLeast(0) ?: 0,
                     url = chapterUrl,
-                    uploadDate = parseRelativeDate(chapterData.optString("createdAtFormatted")),
+                    uploadDate = chapterUploadDate(chapterData),
                     source = source,
                     scanlator = scanlator,
                     branch = scanlator,
@@ -564,84 +574,44 @@ internal class Comix(context: MangaLoaderContext) :
             )
         }
 
-        return chaptersBuilder.toList().reversed()
-    }
-
-    private fun teamKeyOf(chapter: JSONObject): String {
-        val group = chapter.optJSONObject("group") ?: chapter.optJSONObject("scanlation_group")
-        group?.optIntOrNull("id")?.let { return "g$it" }
-        group?.optString("name")?.nullIfEmpty()?.let { return "n:${it.lowercase(Locale.US)}" }
-        return if (chapter.optBoolean("isOfficial")) "official" else "unknown"
-    }
-
-    private fun teamNameOf(chapter: JSONObject): String {
-        val group = chapter.optJSONObject("group") ?: chapter.optJSONObject("scanlation_group")
-        return group?.optString("name")?.nullIfEmpty()
-            ?: if (chapter.optBoolean("isOfficial")) "Official" else "Unknown"
+        return chaptersBuilder.toList()
     }
 
     /**
-     * Picks the most consistent scanlation team to read a series with: the one
-     * covering the most distinct chapter numbers, tie-broken by reaching the
-     * latest chapter, then the earliest, then total votes. This favours a team
-     * that scanlated the whole run end-to-end over one that did a few chapters.
+     * The capture script emits an epoch timestamp (`c`) when the API payload
+     * carried one, and only the site's relative label (`d`, "3 days ago") when
+     * the row was read off the rendered list.
      */
-    private fun selectConsistentTeamKey(chapters: List<JSONObject>): String? {
-        if (chapters.isEmpty()) return null
-        val globalMax = chapters.maxOf { it.optDouble("number", 0.0) }
-
-        val numbers = HashMap<String, MutableSet<Double>>()
-        val minNumber = HashMap<String, Double>()
-        val maxNumber = HashMap<String, Double>()
-        val votes = HashMap<String, Long>()
-        for (chapter in chapters) {
-            val key = teamKeyOf(chapter)
-            val number = chapter.optDouble("number", 0.0)
-            numbers.getOrPut(key) { HashSet() }.add(number)
-            minNumber[key] = minOf(minNumber[key] ?: Double.MAX_VALUE, number)
-            maxNumber[key] = maxOf(maxNumber[key] ?: -Double.MAX_VALUE, number)
-            votes[key] = (votes[key] ?: 0L) + chapter.optLong("votes", 0L)
+    private fun chapterUploadDate(chapter: JSONObject): Long {
+        chapter.optLongOrNull("c")?.let { raw ->
+            return if (raw < SECONDS_TIMESTAMP_LIMIT) raw * 1000L else raw
         }
-
-        return numbers.keys.maxWithOrNull(
-            compareBy(
-                { numbers.getValue(it).size },
-                { if ((maxNumber[it] ?: 0.0) >= globalMax) 1 else 0 },
-                { -(minNumber[it] ?: 0.0) },
-                { votes[it] ?: 0L },
-            ),
-        )
+        return parseRelativeDate(chapter.optString("d"))
     }
 
-    /** Keep one chapter per number, preferring the most-voted (then newest id). */
-    private fun dedupByNumber(chapters: List<JSONObject>): List<JSONObject> {
-        val byNumber = LinkedHashMap<Double, JSONObject>()
-        for (chapter in chapters) {
-            val number = chapter.optDouble("number", 0.0)
-            val current = byNumber[number]
-            if (current == null) {
-                byNumber[number] = chapter
-            } else {
-                val newVotes = chapter.optLong("votes", 0L)
-                val curVotes = current.optLong("votes", 0L)
-                val better = newVotes > curVotes ||
-                    (newVotes == curVotes && chapter.optLong("id", 0L) > current.optLong("id", 0L))
-                if (better) byNumber[number] = chapter
-            }
-        }
-        return byNumber.values.toList()
+    /** The branch a chapter belongs to — its scanlation team. */
+    private fun teamNameOf(group: JSONObject?): String {
+        return group?.optString("name")?.nullIfEmpty()
+            ?: if (group?.optInt("o") == 1) "Official" else "Unknown"
     }
 
-    private suspend fun loadAllChapters(hashId: String): JSONArray {
+    private suspend fun loadAllChapters(hashId: String): JSONObject {
         val titleUrl = "https://$domain/title/$hashId"
 
-        // Let the title page fetch (and decrypt) its chapter list and capture what
-        // it parses. The script prefers the fast single-team path: it reads the
-        // dominant team off the first page, then sets `?group_id=<id>` on the URL
-        // (the SPA reads it and refetches just that team), and paginates within it.
-        // If the URL filter doesn't take, it falls back to paginating every team.
-        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT)
-        return response.optJSONArray("items") ?: JSONArray()
+        // The title page ships no chapters in `script#initial-data` — the list is
+        // fetched over the signed XHR after hydration — so the page has to render
+        // it for us. [CHAPTER_SCRIPT] scrapes the rendered list and walks the
+        // pager, which is why it doesn't matter that our hooks are installed only
+        // after the first request has already been made and parsed.
+        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT, CHAPTER_WEBVIEW_TIMEOUT)
+        val items = response.optJSONArray("items")
+            ?: throw ParseException("Comix chapter capture returned no items array", titleUrl)
+        // `empty` means the page rendered its "No chapters match." state, i.e. the
+        // title really has none — as opposed to us never seeing it render.
+        if (items.length() == 0 && !response.optBoolean("empty")) {
+            throw ParseException("Comix chapter list did not load", titleUrl)
+        }
+        return response
     }
 
     private fun extractInitialDataPages(document: Document): JSONObject? {
@@ -657,13 +627,17 @@ internal class Comix(context: MangaLoaderContext) :
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
-    private suspend fun evaluateWebViewApiJson(pageUrl: String, script: String): JSONObject {
+    private suspend fun evaluateWebViewApiJson(
+        pageUrl: String,
+        script: String,
+        timeoutMs: Long = WEBVIEW_API_TIMEOUT,
+    ): JSONObject {
         val bridgeScript = buildWebViewApiBridgeScript(script)
         val requests = runCatching {
             context.interceptWebViewRequests(
                 pageUrl,
                 InterceptionConfig(
-                    timeoutMs = WEBVIEW_API_TIMEOUT,
+                    timeoutMs = timeoutMs,
                     maxRequests = 1,
                     urlPattern = INTERCEPT_URL_REGEX,
                     pageScript = bridgeScript,
@@ -834,6 +808,10 @@ internal class Comix(context: MangaLoaderContext) :
         return if (has(key) && !isNull(key)) optInt(key) else null
     }
 
+    private fun JSONObject.optLongOrNull(key: String): Long? {
+        return if (has(key) && !isNull(key)) optLong(key) else null
+    }
+
     private fun Float.toChapterUrlPart(): String {
         return if (this % 1f == 0f) {
             toInt().toString()
@@ -856,6 +834,20 @@ internal class Comix(context: MangaLoaderContext) :
         private const val ENC_INCREMENT = 1234567891
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
+
+        // Chapter collection is not time-boxed: [CHAPTER_SCRIPT] pages until the
+        // site reports the list complete. This is only the ceiling for a WebView
+        // that has stopped responding altogether, so it is deliberately far
+        // higher than any real chapter list should need.
+        private const val CHAPTER_WEBVIEW_TIMEOUT = 600000L
+
+        // How long the script waits for one page to render before deciding the
+        // list has stalled and returning what it already has.
+        private const val CHAPTER_STALL_MS = 45000
+
+        // Below this, a timestamp is seconds rather than milliseconds
+        // (2286-11-20 in seconds, 1973-03-03 in milliseconds).
+        private const val SECONDS_TIMESTAMP_LIMIT = 10_000_000_000L
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
@@ -866,134 +858,319 @@ internal class Comix(context: MangaLoaderContext) :
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
 
-        // Loads the chapter list, preferring a single team. It reads the dominant
-        // team off the all-teams first page, then switches the URL to that team's
-        // `?group_id=<id>` (pushState + popstate, which the SPA reads and refetches),
-        // and paginates within that team via the "Next" button. If the URL filter
-        // never yields a single-team response it falls back to paginating all teams.
-        // Resolves with `{ items: [...] }`.
-        private const val CHAPTER_SCRIPT = """
+        // Collects the whole chapter list off the title page.
+        //
+        // The script is injected once the page has finished loading, which is
+        // normally *after* the SPA has already fetched and parsed the first page
+        // of chapters — so hooking `JSON.parse`/`fetch`/XHR alone silently loses
+        // it. The rendered list is therefore the primary source (it is there no
+        // matter when we arrive) and the payload hooks only enrich the pages that
+        // are fetched later, while we walk the pager.
+        //
+        // There is no page or item limit: it keeps paging until the site says the
+        // list is complete, and only gives up if a page stops responding for
+        // [CHAPTER_STALL_MS].
+        //
+        // The result crosses back as a URL fragment, so it is emitted in a
+        // compact form — the shared URL prefix and the scanlation groups are sent
+        // once and referenced by index, and absent fields are omitted:
+        //   prefix  shared start of every chapter URL
+        //   groups  [{ id?, name?, o }] — o = 1 when the group's release is official
+        //   items   [{ i: id, n: number, u: url suffix, g: group index,
+        //              v: volume?, t: name?, c: epoch seconds?, d: relative date? }]
+        private val CHAPTER_SCRIPT = """
             (async () => {
-                const original = JSON.parse;
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-                const mixedItems = [];
-                const mixedSeen = new Set();
-                const pureItems = [];
-                const purePages = new Set();
-                let targetGid = null;
-                let pureLastPage = 1;
-                let sawMixed = false;
+                // A page turn is quick; only the initial render gets the full
+                // stall allowance.
+                const CLICK_TIMEOUT = 15000;
+                const byId = new Map();
+                const fromPayload = new Set();
 
-                const isChapters = (arr) =>
+                // Waits for the page to do something, rather than against an
+                // overall budget: a long series may take as many pages as it
+                // takes, we only bail when nothing moves for a whole stall.
+                const waitFor = async (predicate, timeout) => {
+                    const until = Date.now() + (timeout || $CHAPTER_STALL_MS);
+                    while (Date.now() < until) {
+                        if (predicate()) return true;
+                        await sleep(100);
+                    }
+                    return false;
+                };
+
+                const text = (root, selector) => {
+                    const node = root.querySelector(selector);
+                    return node ? (node.textContent || '').trim() : '';
+                };
+                const number = (raw) => {
+                    const match = /(-?[0-9]+(?:\.[0-9]+)?)/.exec(String(raw || '').replace(/,/g, ''));
+                    return match ? Number(match[1]) : null;
+                };
+                const put = (chapter, isPayload) => {
+                    if (!chapter || chapter.id == null) return;
+                    const key = String(chapter.id);
+                    // Payload rows carry the exact number and a real timestamp,
+                    // so let them replace anything scraped for the same chapter.
+                    if (byId.has(key) && !(isPayload && !fromPayload.has(key))) return;
+                    byId.set(key, chapter);
+                    if (isPayload) fromPayload.add(key);
+                };
+
+                // --- Payload hooks: enrich pages fetched from here on. ---
+                const original = JSON.parse;
+                const isChapterList = (arr) =>
                     Array.isArray(arr) && arr.length > 0 && arr[0] &&
-                    arr[0].id !== undefined && arr[0].number !== undefined;
-
-                const onParsed = (parsed) => {
+                    arr[0].id !== undefined && arr[0].number !== undefined &&
+                    arr[0].url !== undefined;
+                const takePayload = (parsed) => {
                     try {
                         const result = parsed && parsed.result ? parsed.result : parsed;
-                        const arr = result && result.items;
-                        if (!isChapters(arr)) return;
-                        const meta = (result.meta || result.pagination) || {};
-                        const page = Number(meta.page || 1);
-                        const lastPage = Number(
-                            meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
-                        ) || 1;
-                        const gid0 = arr[0].groupId != null ? String(arr[0].groupId) : null;
-                        const pure = gid0 != null && arr.every((ch) => String(ch.groupId) === gid0);
-                        if (pure && targetGid != null && gid0 === targetGid) {
-                            if (!purePages.has(page)) { purePages.add(page); for (const ch of arr) pureItems.push(ch); }
-                            if (lastPage > pureLastPage) pureLastPage = lastPage;
-                        } else if (!pure) {
-                            sawMixed = true;
-                            if (!mixedSeen.has(page)) { mixedSeen.add(page); for (const ch of arr) mixedItems.push(ch); }
+                        const items = result && result.items;
+                        if (!isChapterList(items)) return;
+                        for (const ch of items) {
+                            const group = ch.group || null;
+                            put({
+                                id: ch.id,
+                                number: typeof ch.number === 'number' ? ch.number : number(ch.number),
+                                volume: typeof ch.volume === 'number' ? ch.volume : null,
+                                name: ch.name || null,
+                                url: ch.url || null,
+                                groupId: group && group.id != null ? group.id : null,
+                                groupName: group && group.name ? group.name :
+                                    (ch.isOfficial ? 'Official' : null),
+                                official: !!ch.isOfficial,
+                                createdAt: typeof ch.createdAt === 'number' ? ch.createdAt : null,
+                                date: ch.createdAtFormatted || null
+                            }, true);
                         }
                     } catch (e) {}
                 };
-
-                JSON.parse = function () { const p = original.apply(this, arguments); onParsed(p); return p; };
+                JSON.parse = function () {
+                    const parsed = original.apply(this, arguments);
+                    takePayload(parsed);
+                    return parsed;
+                };
                 if (typeof window.fetch === 'function') {
-                    const of = window.fetch;
+                    const originalFetch = window.fetch;
                     window.fetch = function () {
-                        return of.apply(this, arguments).then((res) => {
-                            try { res.clone().text().then((t) => { try { onParsed(original(t)); } catch (e) {} }).catch(() => {}); } catch (e) {}
-                            return res;
+                        return originalFetch.apply(this, arguments).then((response) => {
+                            try {
+                                response.clone().text().then((body) => {
+                                    try { takePayload(original(body)); } catch (e) {}
+                                }).catch(() => {});
+                            } catch (e) {}
+                            return response;
                         });
                     };
                 }
-                const os = XMLHttpRequest.prototype.send;
+                const originalSend = XMLHttpRequest.prototype.send;
                 XMLHttpRequest.prototype.send = function () {
-                    this.addEventListener('load', function () { try { onParsed(original(this.responseText)); } catch (e) {} });
-                    return os.apply(this, arguments);
+                    this.addEventListener('load', function () {
+                        try { takePayload(original(this.responseText)); } catch (e) {}
+                    });
+                    return originalSend.apply(this, arguments);
                 };
 
-                const setGroup = (gid) => {
-                    try {
-                        const u = new URL(window.location.href);
-                        if (gid == null) u.searchParams.delete('group_id');
-                        else u.searchParams.set('group_id', String(gid));
-                        u.searchParams.delete('page');
-                        history.pushState({}, '', u.pathname + (u.search || ''));
-                        window.dispatchEvent(new PopStateEvent('popstate'));
-                    } catch (e) {}
+                // --- The rendered list: always available, whatever our timing. ---
+                const scrape = () => {
+                    const rows = document.querySelectorAll('.mchap-list .mchap-item');
+                    for (const row of rows) {
+                        const link = row.querySelector('a.mchap-row__primary');
+                        const href = link ? link.getAttribute('href') : null;
+                        if (!href) continue;
+                        // The id leads the last path segment; matching it
+                        // anywhere would pick up a title slug that starts with
+                        // digits instead, collapsing every chapter into one.
+                        const slug = href.split('?')[0].split('/').filter(Boolean).pop() || '';
+                        const idMatch = /^(\d+)-/.exec(slug);
+                        if (!idMatch) continue;
+                        const groupLink = row.querySelector('a.mchap-row__group');
+                        const groupNode = groupLink || row.querySelector('.mchap-row__group');
+                        const groupId = groupLink
+                            ? /\/groups\/(\d+)/.exec(groupLink.getAttribute('href') || '')
+                            : null;
+                        const groupName = groupNode ? (groupNode.textContent || '').trim() : '';
+                        put({
+                            id: Number(idMatch[1]),
+                            number: number(text(row, '.mchap-row__ch')),
+                            volume: number(text(row, '.mchap-row__vol')),
+                            name: text(row, '.mchap-row__title') || null,
+                            url: href,
+                            groupId: groupId ? Number(groupId[1]) : null,
+                            groupName: groupName || null,
+                            official: !!(groupNode && groupNode.classList.contains('is-official')),
+                            createdAt: null,
+                            date: text(row, '.mchap-row__time') || null
+                        }, false);
+                    }
+                    return rows.length;
                 };
 
-                const clickNext = (onFail) => {
-                    let tries = 0;
-                    const iv = setInterval(() => {
-                        let btn = document.querySelector('.mchap-foot button[aria-label*=Next]');
-                        if (!btn) {
-                            const buttons = document.querySelectorAll('button');
-                            for (const b of buttons) {
-                                const label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
-                                if (/next/i.test(label) && !b.disabled) { btn = b; break; }
-                            }
+                // --- Walk the pager. ---
+                // `.mchap-foot__hint` reads "Showing 21 to 40 of 300 items", so it
+                // is both the progress marker and the signal that a click landed.
+                const hint = () => text(document, '.mchap-foot__hint');
+                const isComplete = () => {
+                    const match = /Showing\s+[\d,]+\s+to\s+([\d,]+)\s+of\s+([\d,]+)/i.exec(hint());
+                    if (!match) return false;
+                    return Number(match[1].replace(/,/g, '')) >= Number(match[2].replace(/,/g, ''));
+                };
+                const currentPage = () => {
+                    const active = document.querySelector('.mchap-foot .npager button.npager__num.is-active');
+                    const marked = active ? Number((active.textContent || '').trim()) : NaN;
+                    if (marked > 0) return marked;
+                    const match = /Showing\s+([\d,]+)\s+to\s+([\d,]+)/i.exec(hint());
+                    if (!match) return 1;
+                    const from = Number(match[1].replace(/,/g, ''));
+                    const to = Number(match[2].replace(/,/g, ''));
+                    const size = to - from + 1;
+                    return size > 0 ? Math.floor((from - 1) / size) + 1 : 1;
+                };
+
+                /**
+                 * The pager only draws its Next arrow while the numeric window
+                 * has not yet reached the final page, so Next is already gone on
+                 * the second-to-last page — and on every series short enough to
+                 * fit the whole window, it never appears at all. The numbered
+                 * button for the following page is always on screen though, so
+                 * paging by number is what actually reaches the end.
+                 */
+                const nextButton = () => {
+                    const buttons = document.querySelectorAll('.mchap-foot .npager button');
+                    const wanted = currentPage() + 1;
+                    for (const button of buttons) {
+                        if (button.disabled) continue;
+                        if (Number((button.textContent || '').trim()) === wanted) return button;
+                    }
+                    for (const button of buttons) {
+                        if (button.disabled) continue;
+                        const label = button.getAttribute('aria-label') || '';
+                        if (/next/i.test(label)) return button;
+                    }
+                    return null;
+                };
+                const firstButton = () => {
+                    const buttons = document.querySelectorAll('.mchap-foot .npager button');
+                    for (const button of buttons) {
+                        if (button.disabled) continue;
+                        const label = button.getAttribute('aria-label') || '';
+                        if (/first/i.test(label)) return button;
+                    }
+                    return null;
+                };
+                const total = () => {
+                    const match = /of\s+([\d,]+)\s+items/i.exec(hint());
+                    return match ? Number(match[1].replace(/,/g, '')) : 0;
+                };
+                const isEmptyState = () => !!document.querySelector('.mpage__chapters .uempty');
+                const hasRows = () => !!document.querySelector('.mchap-list .mchap-item');
+
+                // Identifies which rows are on screen, so a page is only read
+                // once it has stopped changing — scraping the instant the first
+                // row appears can catch a half-rendered list.
+                const rowSignature = () => {
+                    const rows = document.querySelectorAll('.mchap-list .mchap-item a.mchap-row__primary');
+                    let signature = rows.length + ':';
+                    for (const row of rows) signature += (row.getAttribute('href') || '') + ',';
+                    return signature;
+                };
+                const settle = async () => {
+                    let previous = null;
+                    for (let i = 0; i < 100; i++) {
+                        const current = rowSignature();
+                        if (previous !== null && current === previous) return;
+                        previous = current;
+                        await sleep(100);
+                    }
+                };
+
+                const walk = async () => {
+                    while (!isComplete()) {
+                        const button = nextButton();
+                        if (!button) break;
+                        const before = hint();
+                        // Read the page being left as well, so a click that
+                        // lands late cannot cost the rows already on screen.
+                        scrape();
+                        button.click();
+                        // A click that does not register would otherwise cost a
+                        // whole page, so give it one more go before bailing out.
+                        if (!await waitFor(() => hint() !== before, CLICK_TIMEOUT)) {
+                            const retry = nextButton();
+                            if (!retry) break;
+                            retry.click();
+                            if (!await waitFor(() => hint() !== before, CLICK_TIMEOUT)) break;
                         }
-                        if (btn && !btn.disabled) { btn.click(); clearInterval(iv); }
-                        else if (++tries > 40) { clearInterval(iv); if (onFail) onFail(); }
-                    }, 100);
+                        await settle();
+                        scrape();
+                    }
                 };
 
-                // 1) Wait for the page's own all-teams first request.
-                for (let i = 0; i < 150 && !sawMixed; i++) await sleep(100);
+                await waitFor(() => hasRows() || isEmptyState());
+                await settle();
+                scrape();
+                await walk();
 
-                // 2) Pick the team that appears most on the first page (tie: newest).
-                const counts = {};
-                for (const ch of mixedItems) { const g = ch.groupId; if (g != null) counts[String(g)] = (counts[String(g)] || 0) + 1; }
-                let best = null, bestC = -1;
-                for (const g in counts) { if (counts[g] > bestC) { bestC = counts[g]; best = g; } }
-                if (best == null && mixedItems[0] && mixedItems[0].groupId != null) best = String(mixedItems[0].groupId);
-
-                // 3) Switch the URL to that team and paginate within it.
-                if (best != null) {
-                    targetGid = best;
-                    setGroup(best);
-                    let got = false;
-                    for (let i = 0; i < 70; i++) { if (purePages.size > 0) { got = true; break; } await sleep(100); }
-                    if (got) {
-                        let last = Date.now(), lastN = pureItems.length, stop = false;
-                        clickNext(() => { stop = true; });
-                        for (let i = 0; i < 900; i++) {
-                            if (purePages.size >= Math.min(pureLastPage, 300)) break;
-                            if (pureItems.length !== lastN) { lastN = pureItems.length; last = Date.now(); stop = false; if (purePages.size < 300) clickNext(() => { stop = true; }); }
-                            if (stop && (Date.now() - last) > 3000) break;
-                            if ((Date.now() - last) > 12000) break;
-                            await sleep(100);
-                        }
-                        if (pureItems.length > 0) return JSON.stringify({ items: pureItems });
+                // The site reports how many chapters exist, so a short result
+                // means a click never landed and a whole page was skipped.
+                // Rewinding and walking once more recovers it.
+                const expected = total();
+                if (expected > 0 && byId.size < expected) {
+                    const first = firstButton();
+                    if (first) {
+                        first.click();
+                        await waitFor(() => /Showing\s+1\s+to/i.test(hint()));
+                        await settle();
+                        scrape();
+                        await walk();
                     }
                 }
 
-                // 4) Fallback: paginate every team via the "Next" button.
-                setGroup(null);
-                let last = Date.now(), lastN = mixedItems.length, stop = false;
-                clickNext(() => { stop = true; });
-                for (let i = 0; i < 800; i++) {
-                    if (mixedItems.length !== lastN) { lastN = mixedItems.length; last = Date.now(); stop = false; if (mixedSeen.size < 250) clickNext(() => { stop = true; }); }
-                    if (stop && (Date.now() - last) > 3000) break;
-                    if (mixedItems.length > 0 && (Date.now() - last) > 9000) break;
-                    await sleep(100);
+                // --- Compact the result for the fragment-URL trip back. ---
+                const collected = [...byId.values()];
+                let prefix = collected.length ? String(collected[0].url || '') : '';
+                for (const chapter of collected) {
+                    const url = String(chapter.url || '');
+                    let i = 0;
+                    while (i < prefix.length && i < url.length && prefix[i] === url[i]) i++;
+                    prefix = prefix.slice(0, i);
                 }
-                return JSON.stringify({ items: mixedItems });
+
+                const groups = [];
+                const groupIndex = new Map();
+                const items = collected.map((chapter) => {
+                    const official = chapter.official ? 1 : 0;
+                    const key = (chapter.groupId != null ? 'i' + chapter.groupId : 'n' + (chapter.groupName || '')) +
+                        '|' + official;
+                    let g = groupIndex.get(key);
+                    if (g === undefined) {
+                        g = groups.length;
+                        groupIndex.set(key, g);
+                        const entry = { o: official };
+                        if (chapter.groupId != null) entry.id = chapter.groupId;
+                        if (chapter.groupName) entry.name = chapter.groupName;
+                        groups.push(entry);
+                    }
+                    const row = {
+                        i: chapter.id,
+                        n: chapter.number,
+                        u: String(chapter.url || '').slice(prefix.length),
+                        g: g
+                    };
+                    if (chapter.volume != null) row.v = chapter.volume;
+                    if (chapter.name) row.t = chapter.name;
+                    if (chapter.createdAt != null) row.c = chapter.createdAt;
+                    else if (chapter.date) row.d = chapter.date;
+                    return row;
+                });
+
+                return JSON.stringify({
+                    prefix: prefix,
+                    groups: groups,
+                    items: items,
+                    empty: items.length === 0 && isEmptyState()
+                });
             })()
         """
 
