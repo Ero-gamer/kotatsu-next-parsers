@@ -63,6 +63,7 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getFilterOptions() = MangaListFilterOptions(
         availableTags = fetchAvailableTags(),
+        availableContentRating = EnumSet.allOf(ContentRating::class.java),
     )
 
     // The site's curated genres, keyed by the numeric id the API expects in
@@ -159,13 +160,20 @@ internal class Comix(context: MangaLoaderContext) :
                 addParam("genres_in[]=$id")
             }
 
-            // Default exclude adult content, unless the user explicitly asked
-            // for one of those genres via the filter.
-            for (excludeId in ADULT_EXCLUDE_IDS) {
-                if (excludeId !in includedIds) {
-                    addParam("genres_ex[]=$excludeId")
+            // Comix exposes four ratings while Kotatsu exposes three. Erotica is
+            // grouped with Suggestive, matching the mapping used for MangaDex.
+            // Keep Safe as the default so an empty filter never opts into NSFW
+            // content; the app can then gate Suggestive and Adult normally.
+            val selectedRatings = filter.contentRating.ifEmpty { setOf(ContentRating.SAFE) }
+            val comixRatings = buildList {
+                if (ContentRating.SAFE in selectedRatings) add("safe")
+                if (ContentRating.SUGGESTIVE in selectedRatings) {
+                    add("suggestive")
+                    add("erotica")
                 }
+                if (ContentRating.ADULT in selectedRatings) add("pornographic")
             }
+            addParam("content_rating=${comixRatings.joinToString(",").urlEncoded()}")
             addParam("page=$page")
         }
 
@@ -282,8 +290,19 @@ internal class Comix(context: MangaLoaderContext) :
             authors = parseAuthors(json),
             state = state,
             source = source,
-            contentRating = if (json.optString("contentRating") in NSFW_RATINGS) ContentRating.ADULT else ContentRating.SAFE,
+            contentRating = parseContentRating(json),
         )
+    }
+
+    private fun parseContentRating(json: JSONObject): ContentRating {
+        val rating = json.optString("contentRating")
+            .ifBlank { json.optString("content_rating") }
+            .lowercase(Locale.ROOT)
+        return when (rating) {
+            "suggestive", "erotica" -> ContentRating.SUGGESTIVE
+            "pornographic" -> ContentRating.ADULT
+            else -> ContentRating.SAFE
+        }
     }
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
@@ -1019,9 +1038,7 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private companion object {
-        private val NSFW_RATINGS = setOf("erotica", "pornographic")
         private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
-        private val ADULT_EXCLUDE_IDS = listOf("87264", "87266", "87268", "87265") // Adult, Hentai, Smut, Ecchi
         private const val SCRAMBLED_FRAGMENT = "scrambled"
         private const val LEGACY_SCRAMBLED_FRAGMENT = "enc-scrambled"
         private val SCRAMBLE_PATH_FALLBACKS = listOf("/i5/", "/si/", "/i/", "/sii/", "/ii/")

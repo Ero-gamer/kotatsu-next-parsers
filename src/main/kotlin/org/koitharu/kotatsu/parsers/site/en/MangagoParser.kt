@@ -262,51 +262,57 @@ internal class MangagoParser(context: MangaLoaderContext) :
     }
 
     private fun buildChapterList(chapters: List<ChapterParseData>): List<MangaChapter> {
-        // Count scanlator occurrences to determine the most common one
-        val scanlatorCounts = mutableMapOf<String, Int>()
-        for (chapter in chapters) {
-            val scanlator = chapter.scanlator ?: extractTitleSuffix(chapter.name) ?: continue
-            scanlatorCounts[scanlator] = (scanlatorCounts[scanlator] ?: 0) + 1
+        val canonicalScanlators = LinkedHashMap<String, String>()
+        val resolvedChapters = chapters.distinctBy { it.url }.map { chapter ->
+            val name = (chapter.scanlator ?: extractTitleSuffix(chapter.name))
+                ?.replace(WHITESPACE_REGEX, " ")
+                ?.trim()
+                ?.takeIf(String::isNotEmpty)
+            val canonicalName = name?.let {
+                canonicalScanlators.getOrPut(it.lowercase(Locale.ROOT)) { it }
+            }
+            chapter.copy(scanlator = canonicalName)
         }
-        val preferredScanlator = scanlatorCounts.maxByOrNull { it.value }?.key
+        val groupNames = resolvedChapters
+            .map { it.scanlator ?: UNKNOWN_SCANLATOR }
+            .distinct()
+        val useBranches = groupNames.size > 1
 
-        val regularChapters = mutableMapOf<Float, ChapterParseData>()
+        // Kotatsu defaults to the branch with the most chapters, so deduplicate only within each group.
+        return resolvedChapters
+            .groupByTo(LinkedHashMap()) { chapter ->
+                if (useBranches) chapter.scanlator ?: UNKNOWN_SCANLATOR else null
+            }
+            .map { (branch, group) -> buildScanlatorBranch(group, branch) }
+            .sortedByDescending(List<MangaChapter>::size)
+            .flatten()
+    }
+
+    private fun buildScanlatorBranch(
+        chapters: List<ChapterParseData>,
+        branch: String?,
+    ): List<MangaChapter> {
+        val regularChapters = LinkedHashMap<Float, ChapterParseData>()
         val specialChapters = mutableListOf<ChapterParseData>()
 
         for (chapter in chapters) {
             val chapterNum = extractChapterNumber(chapter.name)
             if (chapterNum != null) {
                 val existing = regularChapters[chapterNum]
-                if (existing == null) {
+                if (
+                    existing == null ||
+                    chapter.dateUpload > existing.dateUpload ||
+                    chapter.dateUpload == existing.dateUpload && chapter.name.length > existing.name.length
+                ) {
                     regularChapters[chapterNum] = chapter
-                } else {
-                    // Prefer the chapter from the most common scanlator for consistency
-                    val existingSource = existing.scanlator ?: extractTitleSuffix(existing.name)
-                    val newSource = chapter.scanlator ?: extractTitleSuffix(chapter.name)
-
-                    val existingIsPreferred = existingSource == preferredScanlator
-                    val newIsPreferred = newSource == preferredScanlator
-
-                    if (newIsPreferred && !existingIsPreferred) {
-                        regularChapters[chapterNum] = chapter
-                    } else if (!newIsPreferred && existingIsPreferred) {
-                        // Keep existing
-                    } else {
-                        // Same source priority, prefer longer title
-                        if (chapter.name.length > existing.name.length) {
-                            regularChapters[chapterNum] = chapter
-                        }
-                    }
                 }
             } else {
-                // Non-standard chapters (Special, Extra, etc.) go to special list
                 specialChapters.add(chapter)
             }
         }
 
         val result = mutableListOf<MangaChapter>()
 
-        // Add regular chapters sorted by number
         val sortedRegular = regularChapters.entries.sortedBy { it.key }
         for ((chapterNum, chapter) in sortedRegular) {
             result.add(
@@ -318,13 +324,12 @@ internal class MangagoParser(context: MangaLoaderContext) :
                     volume = 0,
                     uploadDate = chapter.dateUpload,
                     scanlator = chapter.scanlator,
-                    branch = null,
+                    branch = branch,
                     source = source,
                 ),
             )
         }
 
-        // Add special chapters at the end with high numbers
         val baseSpecialNumber = (regularChapters.keys.maxOrNull() ?: 0f) + 10000f
         for ((index, chapter) in specialChapters.withIndex()) {
             result.add(
@@ -336,7 +341,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
                     volume = 0,
                     uploadDate = chapter.dateUpload,
                     scanlator = chapter.scanlator,
-                    branch = null,
+                    branch = branch,
                     source = source,
                 ),
             )
@@ -725,5 +730,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
         private val COLS_REGEX = Regex("""var\s*widthnum\s*=\s*heightnum\s*=\s*(\d+);""")
         private val KEY_LOCATION_REGEX = Regex("""str\.charAt\(\s*(\d+)\s*\)""")
         private val JS_FILTERS = listOf("jQuery", "document", "getContext", "toDataURL", "getImageData", "width", "height")
+        private val WHITESPACE_REGEX = Regex("""\s+""")
+        private const val UNKNOWN_SCANLATOR = "Unknown"
     }
 }
