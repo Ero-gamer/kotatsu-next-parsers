@@ -1,5 +1,10 @@
 package org.koitharu.kotatsu.parsers.site.en
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONObject
@@ -49,6 +54,8 @@ internal class BatCave(context: MangaLoaderContext) :
         return chain.proceed(newRequest)
     }
 
+	private val dleGuardMutex = Mutex()
+
 	private val availableTags = suspendLazy(initializer = ::fetchTags)
 	private val captureAllPattern = Regex(".*")
 
@@ -80,6 +87,13 @@ internal class BatCave(context: MangaLoaderContext) :
 		// Try HTTP first - only use WebView if Cloudflare protection is detected
 		tryHttpDocument(initialUrl)?.let { doc ->
 			return doc
+		}
+
+		// DLE Guard redirects to /_c until a WebView sets the trust cookie; solve it and retry
+		if (solveDleGuard(initialUrl)) {
+			tryHttpDocument(initialUrl)?.let { doc ->
+				return doc
+			}
 		}
 
 		// HTTP failed, likely due to Cloudflare protection - try WebView
@@ -124,6 +138,9 @@ internal class BatCave(context: MangaLoaderContext) :
 	private suspend fun tryHttpDocument(url: String): Document? {
 		val response = runCatching { webClient.httpGet(url) }.getOrNull() ?: return null
 		return response.use { res ->
+			if (res.request.url.isDleGuard()) {
+				return null
+			}
 			val doc = runCatching { res.parseHtml() }.getOrNull() ?: return null
 
 			// Check for successful BatCave content first
@@ -172,6 +189,10 @@ internal class BatCave(context: MangaLoaderContext) :
 			return doc
 		}
 
+		if (isDleGuardPage(doc)) {
+			return null
+		}
+
 		// Only reject if it's clearly an active Cloudflare challenge page
 		if (isActiveCloudflareChallenge(html)) {
 			return null
@@ -181,9 +202,46 @@ internal class BatCave(context: MangaLoaderContext) :
 		return doc
 	}
 
+	private suspend fun solveDleGuard(url: String): Boolean {
+		return dleGuardMutex.withLock {
+			if (hasDleGuardTrust()) {
+				return@withLock true
+			}
+			// The challenge page runs its check and redirects back once the trust cookie is set
+			val script = """
+				(() => new Promise(resolve => {
+					const started = Date.now();
+					const check = () => {
+						if (!location.pathname.startsWith("/_c") || document.cookie.indexOf("$DLE_GUARD_COOKIE=") >= 0) {
+							resolve("ok");
+						} else if (Date.now() - started > 25000) {
+							resolve("timeout");
+						} else {
+							setTimeout(check, 250);
+						}
+					};
+					check();
+				}))();
+			""".trimIndent()
+			runCatching { context.evaluateJs(url, script, timeout = 30000L) }
+			hasDleGuardTrust()
+		}
+	}
+
+	private fun hasDleGuardTrust(): Boolean =
+		context.cookieJar.getCookies(domain).any { it.name == DLE_GUARD_COOKIE }
+
+	private fun HttpUrl.isDleGuard(): Boolean = pathSegments.firstOrNull() == "_c"
+
+	private fun isDleGuardPage(doc: Document): Boolean =
+		doc.location().toHttpUrlOrNull()?.isDleGuard() == true
+
 	private fun hasValidBatCaveContent(doc: Document): Boolean {
+		if (isDleGuardPage(doc)) {
+			return false
+		}
 		// Check for BatCave-specific content that indicates successful load
-		return doc.select("div.readed.d-flex.short").isNotEmpty() ||
+		return doc.select("#dle-content > .readed, div.readed.d-flex.short").isNotEmpty() ||
 			doc.select("script:containsData(__DATA__)").isNotEmpty() ||
 			doc.select("script:containsData(__XFILTER__)").isNotEmpty() ||
 			doc.select("h1.serie-title").isNotEmpty() ||
@@ -206,14 +264,14 @@ internal class BatCave(context: MangaLoaderContext) :
 		val urlBuilder = StringBuilder()
 		when {
 			!filter.query.isNullOrEmpty() -> {
-				val encodedQuery = filter.query.splitByWhitespace().joinToString(separator = "%20") { part ->
-					part.urlEncoded()
-				}
-				urlBuilder.append("/search/")
-				urlBuilder.append(encodedQuery)
+				// The query is a single path segment and the site expects a trailing slash
+				val url = "https://$domain".toHttpUrl().newBuilder()
+					.addPathSegment("search")
+					.addPathSegment(filter.query.trim())
 				if (page > 1) {
-					urlBuilder.append("/page/$page/")
+					url.addPathSegment("page").addPathSegment(page.toString())
 				}
+				urlBuilder.append(url.addPathSegment("").build().encodedPath)
 			}
 
 			else -> {
@@ -237,23 +295,23 @@ internal class BatCave(context: MangaLoaderContext) :
 
 		val fullUrl = urlBuilder.toString().toAbsoluteUrl(domain)
 		val doc = captureDocument(fullUrl)
-		return doc.select("div.readed.d-flex.short").map { item ->
-			val a = item.selectFirstOrThrow("a.readed__img.img-fit-cover.anim")
-			val titleElement = item.selectFirstOrThrow("h2.readed__title a")
-			val img = item.selectFirst("img[data-src]")
-			val href = a.attrAsRelativeUrl("href")
+		val items = doc.select("#dle-content > .readed").ifEmpty { doc.select("div.readed.d-flex.short") }
+		return items.mapNotNull { item ->
+			val titleElement = item.selectFirst(".readed__title > a") ?: return@mapNotNull null
+			val img = item.selectFirst(".readed__img img")
+			val href = titleElement.attrAsRelativeUrl("href")
 			Manga(
 				id = generateUid(href),
 				url = href,
-				publicUrl = a.attr("href"),
-				title = titleElement.text(),
+				publicUrl = titleElement.attrAsAbsoluteUrl("href"),
+				title = titleElement.ownText().ifEmpty { titleElement.text() },
 				altTitles = emptySet(),
 				authors = emptySet(),
 				description = null,
 				tags = emptySet(),
 				rating = RATING_UNKNOWN,
 				state = null,
-				coverUrl = img?.attrAsAbsoluteUrlOrNull("data-src"),
+				coverUrl = img?.attrAsAbsoluteUrlOrNull("data-src") ?: img?.attrAsAbsoluteUrlOrNull("src"),
 				contentRating = if (isNsfwSource) ContentRating.ADULT else null,
 				source = source,
 			)
@@ -329,6 +387,11 @@ internal class BatCave(context: MangaLoaderContext) :
 			description = doc.select("div.page__text.full-text.clearfix").textOrNull(),
 			tags = tags ?: manga.tags,
 		)
+	}
+
+	private companion object {
+
+		const val DLE_GUARD_COOKIE = "__guard_trust"
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
