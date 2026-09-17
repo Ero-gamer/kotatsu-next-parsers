@@ -264,7 +264,8 @@ internal class MangagoParser(context: MangaLoaderContext) :
     private fun buildChapterList(chapters: List<ChapterParseData>): List<MangaChapter> {
         val canonicalScanlators = LinkedHashMap<String, String>()
         val resolvedChapters = chapters.distinctBy { it.url }.map { chapter ->
-            val name = (chapter.scanlator ?: extractTitleSuffix(chapter.name))
+            // Only the uploader column names a group: the title suffix is the chapter name ("Chapter 109", "END"...)
+            val name = chapter.scanlator
                 ?.replace(WHITESPACE_REGEX, " ")
                 ?.trim()
                 ?.takeIf(String::isNotEmpty)
@@ -273,24 +274,37 @@ internal class MangagoParser(context: MangaLoaderContext) :
             }
             chapter.copy(scanlator = canonicalName)
         }
-        // Official releases are often uploaded by several accounts: keep them in a single branch
-        val groups = resolvedChapters.groupByTo(LinkedHashMap()) { chapter ->
-            if (isOfficial(chapter)) OFFICIAL_BRANCH else chapter.scanlator ?: UNKNOWN_SCANLATOR
+        val rawGroups = resolvedChapters.groupByTo(LinkedHashMap()) { it.scanlator ?: UNKNOWN_SCANLATOR }
+        // Uploaders without any numbered chapter (notices, announcements) are not worth a branch
+        val groups = LinkedHashMap<String, MutableList<ChapterParseData>>()
+        for ((name, group) in rawGroups) {
+            val key = if (group.none { extractChapterNumber(it.name) != null }) UNKNOWN_SCANLATOR else name
+            groups.getOrPut(key) { ArrayList() }.addAll(group)
         }
         if (groups.size <= 1) {
-            return buildScanlatorBranch(selectChapters(resolvedChapters), branch = null, donors = emptyList())
+            return buildScanlatorBranch(selectChapters(resolvedChapters), null, emptyList(), emptyMap())
         }
+        // Each chapter keeps its historical id in the branch of its uploader
+        val primaryBranch = HashMap<String, String>()
+        groups.forEach { (branch, group) -> group.forEach { primaryBranch[it.url] = branch } }
 
         val selected = groups.mapValuesTo(LinkedHashMap()) { (_, group) -> selectChapters(group) }
-        // Missing chapters of a group are filled from other groups, official ones first, then the largest
-        val donors = selected.entries
-            .sortedWith(compareByDescending<Map.Entry<String, SelectedChapters>> { it.key == OFFICIAL_BRANCH }
-                .thenByDescending { it.value.regular.size })
-            .map { it.key to it.value.regular }
+        // Official releases are often uploaded by several accounts: they are also gathered in a single branch
+        val official = resolvedChapters.filter(::isOfficial)
+        val officialBranch = if (official.isNotEmpty()) {
+            OFFICIAL_BRANCH to SelectedChapters(selectChapters(official).regular, emptyList())
+        } else {
+            null
+        }
 
-        // Branches are listed official first, then by how many chapters the group uploaded itself
-        return donors
-            .map { (branch, _) -> buildScanlatorBranch(selected.getValue(branch), branch, donors) }
+        // Missing chapters of a branch are filled from official releases first, then from the largest uploaders
+        val branches = listOfNotNull(officialBranch) + selected.entries
+            .sortedByDescending { it.value.regular.size }
+            .map { it.key to it.value }
+        val donors = branches.map { (branch, chapters) -> branch to chapters.regular }
+
+        return branches
+            .map { (branch, chapters) -> buildScanlatorBranch(chapters, branch, donors, primaryBranch) }
             .flatten()
     }
 
@@ -329,13 +343,14 @@ internal class MangagoParser(context: MangaLoaderContext) :
         chapters: SelectedChapters,
         branch: String?,
         donors: List<Pair<String, Map<Float, ChapterParseData>>>,
+        primaryBranch: Map<String, String>,
     ): List<MangaChapter> {
-        val regularChapters = HashMap<Float, Pair<ChapterParseData, Boolean>>()
-        chapters.regular.forEach { (number, chapter) -> regularChapters[number] = chapter to false }
+        // Own uploads first, then only the missing numbers are taken from other branches
+        val regularChapters = HashMap<Float, ChapterParseData>(chapters.regular)
         for ((donorBranch, donorChapters) in donors) {
             if (donorBranch == branch) continue
             donorChapters.forEach { (number, chapter) ->
-                regularChapters.putIfAbsent(number, chapter to true)
+                regularChapters.putIfAbsent(number, chapter)
             }
         }
         val specialChapters = chapters.special
@@ -343,12 +358,11 @@ internal class MangagoParser(context: MangaLoaderContext) :
         val result = mutableListOf<MangaChapter>()
 
         val sortedRegular = regularChapters.entries.sortedBy { it.key }
-        for ((chapterNum, entry) in sortedRegular) {
-            val (chapter, isFilled) = entry
+        for ((chapterNum, chapter) in sortedRegular) {
             result.add(
                 MangaChapter(
                     // The same chapter can appear in several branches, ids must stay unique per manga
-                    id = if (isFilled) generateUid("${chapter.url}#$branch") else generateUid(chapter.url),
+                    id = chapterId(chapter, branch, primaryBranch),
                     url = chapter.url,
                     title = chapter.name,
                     number = chapterNum,
@@ -379,6 +393,15 @@ internal class MangagoParser(context: MangaLoaderContext) :
         }
 
         return result
+    }
+
+    private fun chapterId(chapter: ChapterParseData, branch: String?, primaryBranch: Map<String, String>): Long {
+        val primary = primaryBranch[chapter.url]
+        return if (primary == null || primary == branch) {
+            generateUid(chapter.url)
+        } else {
+            generateUid("${chapter.url}#$branch")
+        }
     }
 
     private fun extractTitleSuffix(title: String): String? {

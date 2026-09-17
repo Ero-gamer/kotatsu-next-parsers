@@ -2,7 +2,9 @@ package org.koitharu.kotatsu.parsers.site.en
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Headers
 import okhttp3.HttpUrl
+import org.jsoup.HttpStatusException
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
@@ -56,6 +58,9 @@ internal class BatCave(context: MangaLoaderContext) :
 
 	private val dleGuardMutex = Mutex()
 
+	@Volatile
+	private var lastGuardSolveAt = 0L
+
 	private val availableTags = suspendLazy(initializer = ::fetchTags)
 	private val captureAllPattern = Regex(".*")
 
@@ -65,7 +70,12 @@ internal class BatCave(context: MangaLoaderContext) :
         keys.add(ConfigKey.DisableUpdateChecking(defaultValue = true))
 	}
 
-	override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.UPDATED)
+	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
+		SortOrder.UPDATED,
+		SortOrder.POPULARITY,
+		SortOrder.NEWEST,
+		SortOrder.ALPHABETICAL,
+	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(
@@ -204,7 +214,8 @@ internal class BatCave(context: MangaLoaderContext) :
 
 	private suspend fun solveDleGuard(url: String): Boolean {
 		return dleGuardMutex.withLock {
-			if (hasDleGuardTrust()) {
+			// Parallel requests hitting the guard at the same time reuse a fresh solve
+			if (System.currentTimeMillis() - lastGuardSolveAt < GUARD_TRUST_WINDOW_MS) {
 				return@withLock true
 			}
 			// The challenge page runs its check and redirects back once the trust cookie is set
@@ -223,8 +234,10 @@ internal class BatCave(context: MangaLoaderContext) :
 					check();
 				}))();
 			""".trimIndent()
-			runCatching { context.evaluateJs(url, script, timeout = 30000L) }
-			hasDleGuardTrust()
+			runCatchingCancellable { context.evaluateJs(url, script, timeout = 30000L) }
+			hasDleGuardTrust().also { solved ->
+				if (solved) lastGuardSolveAt = System.currentTimeMillis()
+			}
 		}
 	}
 
@@ -260,9 +273,22 @@ internal class BatCave(context: MangaLoaderContext) :
 			lower.contains("cf-chl-opt")
 	}
 
+	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
+		.set("Sec-Fetch-Dest", "document")
+		.set("Sec-Fetch-Mode", "navigate")
+		.set("Sec-Fetch-Site", "none")
+		.set("Sec-Fetch-User", "?1")
+		.build()
+
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val urlBuilder = StringBuilder()
-		when {
+		val pagePath = if (page > 1) "page/$page/" else ""
+		val (sortBy, direction) = when (order) {
+			SortOrder.POPULARITY -> "rating" to "desc"
+			SortOrder.NEWEST -> "date" to "desc"
+			SortOrder.ALPHABETICAL -> "title" to "asc"
+			else -> "editdate" to "desc"
+		}
+		return when {
 			!filter.query.isNullOrEmpty() -> {
 				// The query is a single path segment and the site expects a trailing slash
 				val url = "https://$domain".toHttpUrl().newBuilder()
@@ -271,30 +297,95 @@ internal class BatCave(context: MangaLoaderContext) :
 				if (page > 1) {
 					url.addPathSegment("page").addPathSegment(page.toString())
 				}
-				urlBuilder.append(url.addPathSegment("").build().encodedPath)
+				parseReadedList(fetchDocument(url.addPathSegment("").build().toString()))
 			}
+
+			filter.tags.isNotEmpty() || filter.yearFrom != YEAR_UNKNOWN || filter.yearTo != YEAR_UNKNOWN -> {
+				val filterPath = buildString {
+					if (filter.yearFrom != YEAR_UNKNOWN) append("y[from]=").append(filter.yearFrom).append('/')
+					if (filter.yearTo != YEAR_UNKNOWN) append("y[to]=").append(filter.yearTo).append('/')
+					if (filter.tags.isNotEmpty()) append("g=").append(filter.tags.joinToString(",") { it.key }).append('/')
+				}
+				val form = mapOf(
+					"dlenewssortby" to sortBy,
+					"dledirection" to direction,
+					"set_new_sort" to "dle_sort_xfilter",
+					"set_direction_sort" to "dle_direction_xfilter",
+				)
+				parseReadedList(fetchDocument("https://$domain/ComicList/$filterPath$pagePath", form))
+			}
+
+			// The home page is the only list sorted by last chapter update
+			order == SortOrder.UPDATED -> parseLatestList(fetchDocument("https://$domain/$pagePath"))
 
 			else -> {
-				urlBuilder.append("/ComicList")
-				if (filter.yearFrom != YEAR_UNKNOWN) {
-					urlBuilder.append("/y[from]=${filter.yearFrom}")
-				}
-				if (filter.yearTo != YEAR_UNKNOWN) {
-					urlBuilder.append("/y[to]=${filter.yearTo}")
-				}
-				if (filter.tags.isNotEmpty()) {
-					urlBuilder.append("/g=")
-					urlBuilder.append(filter.tags.joinToString(",") { it.key })
-				}
-				urlBuilder.append("/sort")
-				if (page > 1) {
-					urlBuilder.append("/page/$page/")
-				}
+				val form = mapOf(
+					"dlenewssortby" to sortBy,
+					"dledirection" to direction,
+					"set_new_sort" to "dle_sort_cat_1",
+					"set_direction_sort" to "dle_direction_cat_1",
+				)
+				parseReadedList(fetchDocument("https://$domain/comix/$pagePath", form))
 			}
 		}
+	}
 
-		val fullUrl = urlBuilder.toString().toAbsoluteUrl(domain)
-		val doc = captureDocument(fullUrl)
+	/**
+	 * Loads a list page, solving the DLE Guard once when the request is redirected to its challenge.
+	 * The challenge page answers 404, so the redirect also shows up as a failed request.
+	 */
+	private suspend fun fetchDocument(url: String, form: Map<String, String>? = null): Document {
+		var guardSolved = false
+		while (true) {
+			val result = runCatchingCancellable {
+				if (form == null) webClient.httpGet(url) else webClient.httpPost(url.toHttpUrl(), form)
+			}
+			val response = result.getOrNull()
+			val error = result.exceptionOrNull()
+			val isGuarded = response?.request?.url?.isDleGuard() == true ||
+				(error as? HttpStatusException)?.url?.toHttpUrlOrNull()?.isDleGuard() == true
+			if (!isGuarded) {
+				if (error != null) throw error
+				val doc = checkNotNull(response).parseHtml()
+				if (isActiveCloudflareChallenge(doc.outerHtml())) {
+					context.requestBrowserAction(this, url)
+				}
+				return doc
+			}
+			response?.close()
+			// The guard can only be solved by loading a page, POST requests are replayed after solving it on the home page
+			if (guardSolved || !solveDleGuard(if (form == null) url else "https://$domain/")) {
+				context.requestBrowserAction(this, url)
+			}
+			guardSolved = true
+		}
+	}
+
+	private fun parseLatestList(doc: Document): List<Manga> {
+		return doc.select("#content-load > .latest.grid-item").mapNotNull { item ->
+			val titleElement = item.selectFirst(".latest__title > a") ?: return@mapNotNull null
+			val title = titleElement.ownText().trim().ifEmpty { return@mapNotNull null }
+			val href = titleElement.attrAsRelativeUrl("href")
+			val img = item.selectFirst(".latest__img img")
+			Manga(
+				id = generateUid(href),
+				url = href,
+				publicUrl = titleElement.attrAsAbsoluteUrl("href"),
+				title = title,
+				altTitles = emptySet(),
+				authors = emptySet(),
+				description = null,
+				tags = emptySet(),
+				rating = RATING_UNKNOWN,
+				state = null,
+				coverUrl = img?.attrAsAbsoluteUrlOrNull("src") ?: img?.attrAsAbsoluteUrlOrNull("data-src"),
+				contentRating = if (isNsfwSource) ContentRating.ADULT else null,
+				source = source,
+			)
+		}
+	}
+
+	private fun parseReadedList(doc: Document): List<Manga> {
 		val items = doc.select("#dle-content > .readed").ifEmpty { doc.select("div.readed.d-flex.short") }
 		return items.mapNotNull { item ->
 			val titleElement = item.selectFirst(".readed__title > a") ?: return@mapNotNull null
@@ -392,6 +483,7 @@ internal class BatCave(context: MangaLoaderContext) :
 	private companion object {
 
 		const val DLE_GUARD_COOKIE = "__guard_trust"
+		const val GUARD_TRUST_WINDOW_MS = 5_000L
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
