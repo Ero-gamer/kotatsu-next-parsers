@@ -2,6 +2,9 @@ package org.koitharu.kotatsu.parsers.site.en
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Request
@@ -22,6 +25,7 @@ import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
+import java.io.IOException
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.*
@@ -130,15 +134,17 @@ internal class Comix(context: MangaLoaderContext) :
             }
 
             if (!query.isNullOrEmpty()) {
-                // The website routes keyword search through `q` + `sort`.
-                addParam("q=${query.urlEncoded()}")
-                addParam("sort=relevance:desc")
+                // `keyword` is what the server reads into the page's initial list
+                // parameters, so the page searches from its first request; with the
+                // page's own `q` it first lists everything, then searches once its
+                // search box settles (keiyoushi does the same).
+                addParam("keyword=${query.urlEncoded()}")
+                addParam("order[relevance]=desc")
             } else {
                 when (order) {
-                    // Relevance is only meaningful alongside a keyword, and it is
-                    // not an `order[...]` field at all — the site passes it as
-                    // `sort=relevance:desc`. With no query it falls back to the
-                    // latest-update ordering, same as the website does.
+                    // Relevance is only meaningful alongside a keyword. With no query
+                    // it falls back to the latest-update ordering, same as the
+                    // website does.
                     SortOrder.RELEVANCE -> addParam("order[chapter_updated_at]=desc")
                     SortOrder.UPDATED -> addParam("order[chapter_updated_at]=desc")
                     SortOrder.POPULARITY -> addParam("order[views_30d]=desc")
@@ -197,6 +203,11 @@ internal class Comix(context: MangaLoaderContext) :
             .getOrNull()
             ?.let { extractInitialDataItems(it) }
             ?.let { return it }
+        // The WebView shares the client's cookies and agent, so it would land on the
+        // same challenge.
+        if (sawCloudflare) {
+            requestCloudflareVerification(browseUrl)
+        }
 
         val response = try {
             evaluateWebViewApiJson(browseUrl, BROWSE_CAPTURE_SCRIPT)
@@ -346,15 +357,18 @@ internal class Comix(context: MangaLoaderContext) :
         val chapterId = chapter.url.substringAfterLast("/").substringBefore("-")
         val readerUrl = chapter.url.toAbsoluteUrl(domain)
 
-        // Capture the reader page's own (signed, decrypted) page payload rather
-        // than re-implementing the request signing, which hangs (see [loadAllChapters]).
+        // The page list comes over the site's signed, encoded API, so the reader page's
+        // own client fetches it for us (see [pageScript]).
         var sawCloudflare = false
         val response = runCatching { webClient.httpGet(readerUrl).parseHtml() }
             .onFailure { sawCloudflare = it.isCloudFlareProtection() }
             .getOrNull()
             ?.let { extractInitialDataPages(it) }
             ?: try {
-                evaluateWebViewApiJson(readerUrl, PAGE_CAPTURE_SCRIPT)
+                if (sawCloudflare) {
+                    requestCloudflareVerification(readerUrl)
+                }
+                evaluateWebViewApiJson(readerUrl, pageScript(chapterId.toJsString()))
             } catch (e: Exception) {
                 if (sawCloudflare || e.isCloudFlareProtection()) {
                     requestCloudflareVerification(readerUrl, e)
@@ -366,6 +380,10 @@ internal class Comix(context: MangaLoaderContext) :
         val pages = pagesRoot?.optJSONArray("items")
             ?: response.optJSONObject("result")?.optJSONArray("pages")
             ?: JSONArray()
+        val altDomains = pagesRoot?.optJSONArray("alt")
+            ?.let { alt -> (0 until alt.length()).mapNotNull { alt.optString(it).nullIfEmpty() } }
+            .orEmpty()
+        val altNode = pagesRoot?.optString("node")?.nullIfEmpty()
 
         return (0 until pages.length()).map { i ->
             val item = pages.optJSONObject(i)
@@ -379,32 +397,18 @@ internal class Comix(context: MangaLoaderContext) :
             // image. The server only returns the x-scramble-* headers when the request
             // carries the `v3` query flag, so we add it here; the interceptor then
             // descrambles based on those headers.
-            //
-            // Everything else may still be protected by the older byte-level XOR, which
-            // the server applies to every fourth page. Those responses only carry
-            // x-enc-seed when the request has an `Origin` header — the exact opposite of
-            // the v3 images, which withhold x-scramble-seed when `Origin` is present —
-            // so the two kinds are tagged apart here and [intercept] sets the header for
-            // the legacy ones only.
-            //
-            // Both fragments are dropped before the request goes out; they also keep a
-            // protected page from colliding with an unprotected namesake in the cache.
             val parsedUrl = imageUrl.toHttpUrlOrNull()
             val isV3 = item?.optInt("s", 0) == 1 || parsedUrl?.queryParameterNames?.contains("v3") == true
-            val isLegacyScramble = !isV3 && (i + 1) % 4 == 0
-            val finalUrl = when {
-                isV3 -> {
-                    val withV3 = if (parsedUrl == null || parsedUrl.queryParameterNames.contains("v3")) {
-                        imageUrl
-                    } else {
-                        parsedUrl.newBuilder().addQueryParameter("v3", null).build().toString()
-                    }
-                    "$withV3#$SCRAMBLED_FRAGMENT"
-                }
-
-                isLegacyScramble -> "$imageUrl#$LEGACY_SCRAMBLED_FRAGMENT"
-                else -> imageUrl
+            val withV3 = if (!isV3 || parsedUrl == null || parsedUrl.queryParameterNames.contains("v3")) {
+                imageUrl
+            } else {
+                parsedUrl.newBuilder().addQueryParameter("v3", null).build().toString()
             }
+            // The fragment never leaves the device: it tells [intercept] this is a page
+            // image, and which hosts to retry it on.
+            val altHosts = parsedUrl?.host?.let { altHostsFor(it, i, altDomains, altNode) }.orEmpty()
+            val fragment = if (altHosts.isEmpty()) PAGE_FRAGMENT else PAGE_FRAGMENT + ":" + altHosts.joinToString(",")
+            val finalUrl = "${withV3.substringBefore('#')}#$fragment"
             MangaPage(
                 id = generateUid("$chapterId-$i"),
                 url = finalUrl,
@@ -414,19 +418,39 @@ internal class Comix(context: MangaLoaderContext) :
         }
     }
 
+    /**
+     * Hosts to retry a page image on, in the site reader's order: the same host
+     * label on each alternate domain, then the node label on each (after
+     * keiyoushi's ChapterPages.altHosts).
+     */
+    private fun altHostsFor(host: String, index: Int, altDomains: List<String>, node: String?): List<String> {
+        if (altDomains.isEmpty()) return emptyList()
+        val label = host.substringBefore('.')
+        val start = index % altDomains.size
+        val domains = altDomains.drop(start) + altDomains.take(start)
+        val hosts = domains.map { "$label.$it" } + domains.map { "${node ?: label}.$it" }
+        return List(ALT_HOST_ATTEMPTS) { hosts[it % hosts.size] }.filter { it != host }.distinct()
+    }
+
     override fun intercept(chain: Interceptor.Chain): Response {
-        // Legacy byte-XOR images only come back with their x-enc-* headers when the
-        // request carries an `Origin`; v3 tile-scrambled ones do the reverse and
-        // withhold x-scramble-seed when it is present, so it is added for the pages
-        // [getPages] tagged as legacy and for nothing else.
-        val request = chain.request().let { original ->
-            if (original.url.fragment == LEGACY_SCRAMBLED_FRAGMENT && original.header("Origin") == null) {
-                original.newBuilder().header("Origin", "https://$domain").build()
-            } else {
-                original
-            }
+        val original = chain.request()
+        val fragment = original.url.fragment
+        val isPageImage = fragment == PAGE_FRAGMENT || fragment?.startsWith("$PAGE_FRAGMENT:") == true
+        // The image hosts answer 403 to any request that names the site in Referer
+        // or Origin, and the app adds a Referer to every request.
+        val request = if (isPageImage) {
+            original.newBuilder().removeHeader("Referer").removeHeader("Origin").build()
+        } else {
+            original
         }
-        val response = retryScramblePathFallbacks(chain, request, chain.proceed(request))
+        val altHosts = fragment?.substringAfter("$PAGE_FRAGMENT:", "")
+            ?.split(',')?.filter { it.isNotBlank() }
+            .orEmpty()
+        val response = if (isPageImage && altHosts.isNotEmpty()) {
+            retryOnAltHosts(chain, request, altHosts)
+        } else {
+            retryScramblePathFallbacks(chain, request, chain.proceed(request))
+        }
         if (!response.isSuccessful) {
             return response
         }
@@ -477,6 +501,37 @@ internal class Comix(context: MangaLoaderContext) :
         return context.redrawImageResponse(decodedResponse) { bitmap ->
             descramble(bitmap, scrambleSeed!! xor scrambleHash, rawScrambleAlgo)
         }
+    }
+
+    /**
+     * A page image that fails is retried on the alternate hosts the page list names,
+     * a moment apart, like the site's reader does (after keiyoushi's altHostFallback).
+     */
+    private fun retryOnAltHosts(chain: Interceptor.Chain, request: Request, altHosts: List<String>): Response {
+        var failed: Response? = null
+        var error: IOException? = null
+        val urls = listOf(request.url) + altHosts.mapIndexed { i, host ->
+            request.url.newBuilder()
+                .host(host)
+                .setQueryParameter("r", (i + 1).toString())
+                .build()
+        }
+        for (url in urls) {
+            if (failed != null || error != null) {
+                failed?.closeQuietly()
+                failed = null
+                Thread.sleep(ALT_HOST_RETRY_DELAY_MS)
+            }
+            try {
+                val response = chain.proceed(request.newBuilder().url(url).build())
+                if (response.isSuccessful) return response
+                failed = response
+            } catch (e: IOException) {
+                if (chain.call().isCanceled()) throw e
+                error = e
+            }
+        }
+        return failed ?: throw error!!
     }
 
     /**
@@ -712,24 +767,43 @@ internal class Comix(context: MangaLoaderContext) :
 
     /**
      * The title page ships no chapters in `script#initial-data` — the list comes over
-     * a signed XHR after hydration — so the page's own code has to make the call for
-     * us. The script does not need the rendered list though: it pulls the signing
-     * bundle the page's main module references and talks to the chapter API directly.
+     * a signed, encoded XHR after hydration — so the page's own code has to make the
+     * calls for us: the script asks the site's API client for every page in turn
+     * (see [chapterScript]).
      */
     private suspend fun loadAllChapters(hashId: String): JSONObject {
         val titleUrl = "https://$domain/title/$hashId"
 
         // No HTTP fetch of the title page here: the script runs on that very page in
-        // the WebView and reads the module tag itself, so this starts straight away
-        // and in parallel with the details request rather than queueing behind it.
-        val response = evaluateWebViewApiJson(
-            pageUrl = titleUrl,
-            script = chapterScript(hashId.toJsString(), cachedEnvUrl?.toJsString() ?: "null"),
-            timeoutMs = CHAPTER_WEBVIEW_TIMEOUT,
-        )
-        // The bundle url only changes when the site is redeployed, so reusing it saves
-        // downloading the whole main bundle on every later chapter load.
-        response.optString("env").nullIfEmpty()?.let { cachedEnvUrl = it }
+        // the WebView, so this starts straight away and in parallel with the details
+        // request rather than queueing behind it.
+        //
+        // One title at a time, and the next one's page (which asks for its first
+        // chapter page as it loads) only after the usual interval, so opening several
+        // titles in a row stays within the pace the site tolerates.
+        val response = chapterListLock.withLock {
+            val wait = chapterListEndedAt + CHAPTER_PAGE_INTERVAL_MS - System.currentTimeMillis()
+            if (wait > 0) delay(wait)
+            try {
+                evaluateWebViewApiJson(
+                    pageUrl = titleUrl,
+                    script = chapterScript(hashId.toJsString()),
+                    timeoutMs = CHAPTER_WEBVIEW_TIMEOUT,
+                )
+            } catch (e: ParseException) {
+                // The WebView cannot always say it was stopped by Cloudflare (see
+                // [buildWebViewApiBridgeScript]), so a failure gets one plain request
+                // to tell.
+                val cloudflare = runCatching { webClient.httpGet(titleUrl).close() }
+                    .exceptionOrNull()?.isCloudFlareProtection() == true
+                if (cloudflare) {
+                    requestCloudflareVerification(titleUrl, e)
+                }
+                throw e
+            } finally {
+                chapterListEndedAt = System.currentTimeMillis()
+            }
+        }
         val items = response.optJSONArray("items")
             ?: throw ParseException("Comix chapter capture returned no items array", titleUrl)
         if (items.length() == 0 && !response.optBoolean("empty")) {
@@ -790,11 +864,17 @@ internal class Comix(context: MangaLoaderContext) :
             if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
                 requestCloudflareVerification(pageUrl)
             }
+            if (decoded == SITE_CAPTCHA) {
+                requestSiteCaptcha(pageUrl)
+            }
             if (decoded.isBlank()) {
                 throw ParseException("Comix WebView API returned an empty response", pageUrl)
             }
             val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
                 throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", pageUrl, e)
+            }
+            if (json.optBoolean("blocked")) {
+                throw ParseException(BLOCKED_MESSAGE, pageUrl)
             }
             json.optString("error").nullIfEmpty()?.let { error ->
                 throw ParseException("Comix WebView API failed: $error", pageUrl)
@@ -816,12 +896,38 @@ internal class Comix(context: MangaLoaderContext) :
     private fun buildWebViewApiBridgeScript(script: String): String {
         // The script is injected on every navigation and polled while a page is up,
         // so it can start many times over. One run at a time, and a run that has
-        // nothing yet (null) leaves without navigating so a later one can try again.
+        // nothing yet (null) leaves without reporting so a later one can try again.
+        //
+        // The result goes out as a request for a made-up url that the app captures.
+        // It is a fetch rather than a navigation: WebView hands navigations to the
+        // app without request headers, which the app's capture fails on, so a
+        // navigation never came back. A fetch drops the url fragment, hence the
+        // query string.
+        //
+        // Cloudflare's challenge page only lets scripts connect to its own hosts, so
+        // there the fetch is refused and a navigation goes out instead. With the app
+        // failing on it the capture ends in an error, and the caller tells a
+        // challenge apart with a plain request.
         return """
             (function() {
+                $SITE_HOOKS_JS
                 const state = '__comixBridgeState';
                 if (window[state]) return;
                 window[state] = true;
+                const report = (url) => {
+                    const refused = (event) => {
+                        if (String(event.blockedURI || '').indexOf('kotatsu.intercept') !== -1) {
+                            document.removeEventListener('securitypolicyviolation', refused);
+                            window.location.href = url;
+                        }
+                    };
+                    document.addEventListener('securitypolicyviolation', refused);
+                    try {
+                        fetch(url, { mode: 'no-cors', cache: 'no-store' }).catch(() => {});
+                    } catch (e) {
+                        window.location.href = url;
+                    }
+                };
                 (async function() {
                     try {
                         const result = await $script;
@@ -842,10 +948,10 @@ internal class Comix(context: MangaLoaderContext) :
                             .replace(/\+/g, '-')
                             .replace(/\//g, '_')
                             .replace(/=+$/g, '');
-                        window.location.href = "$INTERCEPT_RESULT_URL#data64=" + data;
+                        report("$INTERCEPT_RESULT_URL?data64=" + data);
                     } catch (e) {
-                        window.location.href = "$INTERCEPT_ERROR_URL#msg=" +
-                            encodeURIComponent(String((e && e.message) || e));
+                        report("$INTERCEPT_ERROR_URL?msg=" +
+                            encodeURIComponent(String((e && e.message) || e)));
                     }
                 })();
             })();
@@ -897,6 +1003,19 @@ internal class Comix(context: MangaLoaderContext) :
             context.requestBrowserAction(this, url)
         } catch (e: UnsupportedOperationException) {
             throw ParseException(WEBVIEW_LOAD_MESSAGE, url, e)
+        }
+    }
+
+    /**
+     * The site's own "verify you're human" captcha, which it puts up when its API
+     * answers 403 captcha_required. The reader solves it in the browser, where the
+     * page asks for it again.
+     */
+    private fun requestSiteCaptcha(url: String): Nothing {
+        try {
+            context.requestBrowserAction(this, url)
+        } catch (e: UnsupportedOperationException) {
+            throw ParseException(SITE_CAPTCHA_MESSAGE, url, e)
         }
     }
 
@@ -957,9 +1076,10 @@ internal class Comix(context: MangaLoaderContext) :
         }
     }
 
-    /** Url of the site's env bundle, reused across chapter loads. */
+    private val chapterListLock = Mutex()
+
     @Volatile
-    private var cachedEnvUrl: String? = null
+    private var chapterListEndedAt = 0L
 
     private val tagIdCache = ConcurrentHashMap<String, String>()
 
@@ -1039,9 +1159,10 @@ internal class Comix(context: MangaLoaderContext) :
 
     private companion object {
         private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
-        private const val SCRAMBLED_FRAGMENT = "scrambled"
-        private const val LEGACY_SCRAMBLED_FRAGMENT = "enc-scrambled"
-        private val SCRAMBLE_PATH_FALLBACKS = listOf("/i5/", "/si/", "/i/", "/sii/", "/ii/")
+        private const val PAGE_FRAGMENT = "comix-page"
+        private const val ALT_HOST_ATTEMPTS = 6
+        private const val ALT_HOST_RETRY_DELAY_MS = 2000L
+        private val SCRAMBLE_PATH_FALLBACKS = listOf("/hi/", "/fcf/", "/i5/", "/si/", "/i/", "/sii/", "/ii/")
         private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
         private const val GRID_COLS = 5
         private const val GRID_ROWS = 5
@@ -1053,29 +1174,31 @@ internal class Comix(context: MangaLoaderContext) :
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
 
-        // Chapter collection is not time-boxed: [CHAPTER_SCRIPT] pages until the
-        // site reports the list complete. This is only the ceiling for a WebView
-        // that has stopped responding altogether, so it is deliberately far
-        // higher than any real chapter list should need.
-        private const val CHAPTER_WEBVIEW_TIMEOUT = 600000L
+        // Chapter collection is not time-boxed: [chapterScript] pages until the site
+        // reports the list complete, one page every [CHAPTER_PAGE_INTERVAL_MS]. This
+        // is only the ceiling for a WebView that has stopped responding altogether.
+        private const val CHAPTER_WEBVIEW_TIMEOUT = 900000L
 
-        // How long the script waits for one page to render before deciding the
-        // list has stalled and returning what it already has.
-        private const val CHAPTER_STALL_MS = 45000
+        // What the site's own chapter list asks for. Larger pages, or pages asked for
+        // faster than this, get every request from the device answered with HTTP 502
+        // for a while.
+        private const val CHAPTER_PAGE_LIMIT = 20
+        private const val CHAPTER_PAGE_INTERVAL_MS = 2500
 
-        // Ceiling for the API fast path: 100 chapters a call, so this is far beyond
-        // any real series and only guards against a pager that never reports its end.
-        private const val MAX_CHAPTER_API_PAGES = 200
+        // Ceiling on chapter pages, far beyond any real series; only guards against a
+        // pager that never reports its end.
+        private const val MAX_CHAPTER_API_PAGES = 400
 
-        // How long the fast path waits for the page's main module to appear before
-        // giving up on it and falling back to walking the rendered pager.
-        private const val BUNDLE_WAIT_MS = 20000
+        // How long the scripts look for the site's API client among its modules,
+        // which keep loading after the page's load event.
+        private const val SITE_API_WAIT_MS = 20000
 
         // Below this, a timestamp is seconds rather than milliseconds
         // (2286-11-20 in seconds, 1973-03-03 in milliseconds).
         private const val SECONDS_TIMESTAMP_LIMIT = 10_000_000_000L
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
         private const val WEBVIEW_LOAD_FAILED = "WEBVIEW_LOAD_FAILED"
+        private const val SITE_CAPTCHA = "SITE_CAPTCHA"
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
         private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
@@ -1083,20 +1206,100 @@ internal class Comix(context: MangaLoaderContext) :
             "Comix could not get past the Cloudflare check. Try again in a moment."
         private const val WEBVIEW_LOAD_MESSAGE =
             "Comix could not load the page in WebView. Open it in the browser and try again."
+        private const val SITE_CAPTCHA_MESSAGE =
+            "Comix wants you to solve its captcha. Open the site in the browser, solve it and try again."
+        private const val BLOCKED_MESSAGE =
+            "Comix is refusing requests from this device for now (HTTP 502). Try again later."
         private const val WEBVIEW_CACHE_BUSTER_PARAM = "_kotatsu_retry"
         private const val WEBVIEW_NAVIGATION_ATTEMPTS = 2
 
         private const val CAUSE_CHAIN_LIMIT = 8
-        private const val MAIN_MODULE_SELECTOR = "script[type=module][src*=/dist/main-]"
         private const val MAIN_MODULE_SELECTOR_JS = "'script[type=module][src*=\"/dist/main-\"]'"
-
-        // 100ms apart; only ever waits for the served HTML to be parsed.
-        private const val BUNDLE_WAIT_TICKS = 200
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
 
-        // Concurrent chapter-list requests once the page count is known.
-        private const val CHAPTER_API_CONCURRENCY = 6
+        // Installed once per document, ahead of the scripts.
+        //
+        // Records what JSON.parse returns in `window.__comixSeen`, newest last, which
+        // is how the browse list reaches the page once decoded.
+        //
+        // Records each title-list response (`/api/v1/manga`) in `window.__comixLists`
+        // with the keyword it was asked for, so the browse capture can tell a search
+        // result from a list the page loaded before the search applied (after
+        // keiyoushi's browse capture).
+        //
+        // Notes a 403 captcha_required answer: the site asking for its own captcha.
+        // The site's client then waits for it to be solved, so a call that hit it
+        // never settles in a hidden WebView.
+        private const val SITE_HOOKS_JS = """
+                if (!window.__comixHooks) {
+                    window.__comixHooks = true;
+                    const seen = window.__comixSeen = [];
+                    const keep = (holder) => {
+                        if (holder && typeof holder === 'object' && Array.isArray(holder.items)) {
+                            seen.push(holder);
+                            if (seen.length > 100) seen.shift();
+                        }
+                    };
+                    const parse = JSON.parse;
+                    JSON.parse = function () {
+                        const value = parse.apply(this, arguments);
+                        try {
+                            if (value && typeof value === 'object') {
+                                keep(value);
+                                const result = value.result;
+                                if (result && typeof result === 'object') {
+                                    keep(result);
+                                    keep(result.pages);
+                                }
+                            }
+                        } catch (e) {}
+                        return value;
+                    };
+                    const lists = window.__comixLists = [];
+                    const record = (rawUrl, text) => {
+                        try {
+                            const url = new URL(String(rawUrl || ''), location.origin);
+                            if (url.pathname.replace(/\/+$/, '') !== '/api/v1/manga') return;
+                            const value = parse(text);
+                            const holder = value && value.result && Array.isArray(value.result.items)
+                                ? value.result
+                                : (value && Array.isArray(value.items) ? value : null);
+                            if (holder) lists.push({ keyword: (url.searchParams.get('keyword') || '').trim(), holder: holder });
+                        } catch (e) {}
+                    };
+                    const open = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function (method, url) {
+                        this.__comixUrl = url;
+                        return open.apply(this, arguments);
+                    };
+                    const send = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.send = function () {
+                        this.addEventListener('load', function () {
+                            try {
+                                if (this.status === 403 && String(this.responseText).indexOf('captcha_required') !== -1) {
+                                    window.__comixCaptcha = true;
+                                }
+                                if (this.status === 200) record(this.responseURL || this.__comixUrl, this.responseText);
+                            } catch (e) {}
+                        });
+                        return send.apply(this, arguments);
+                    };
+                    if (typeof window.fetch === 'function') {
+                        const fetchNative = window.fetch;
+                        window.fetch = function () {
+                            return fetchNative.apply(this, arguments).then((response) => {
+                                try {
+                                    if (response && response.ok && String(response.url).indexOf('/api/v1/manga') !== -1) {
+                                        response.clone().text().then((text) => record(response.url, text)).catch(() => {});
+                                    }
+                                } catch (e) {}
+                                return response;
+                            });
+                        };
+                    }
+                }
+        """
 
         // Recognises blocking documents from stable DOM markers rather than their
         // localised titles. [evaluateWebViewApiJson] turns a Cloudflare result into
@@ -1126,204 +1329,246 @@ internal class Comix(context: MangaLoaderContext) :
                         return false;
                     }
                 };
+                const isSiteCaptcha = () => {
+                    try {
+                        return !!window.__comixCaptcha || !!document.querySelector('iframe[src*="/@waf/"]');
+                    } catch (e) {
+                        return false;
+                    }
+                };
+                // Cloudflare's own error page, which is what the site's block looks like.
+                const isBadGateway = () => {
+                    try {
+                        return /\b502\b/.test(document.title) && !!document.querySelector('#cf-error-details, .cf-error-details, #cf-wrapper');
+                    } catch (e) {
+                        return false;
+                    }
+                };
+                const blockedResult = () => JSON.stringify({ error: 'HTTP 502', blocked: true });
+        """
+
+        // The site's own API client (after keiyoushi's site_api.js): a route from its
+        // route table and its GET helper, which goes through the site's request
+        // signing and resolves to the decoded response body. Both are found among
+        // the exports of the modules next to the page's main module, so nothing
+        // depends on the minified names. `siteApi(isRoute)` resolves to
+        // `(id, params) => Promise<body>`, or null when not found in time.
+        //
+        // Also defines `untilSettled`, which races a call against the site's captcha
+        // (see [SITE_HOOKS_JS]) so a call that hit it is not waited on forever.
+        private const val SITE_API_JS = """
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                // A bare import() in an injected script is parsed in the wrong context;
+                // going through Function keeps it a real dynamic import.
+                const importModule = new Function('url', 'return import(url)');
+                const isGet = (value) => typeof value === 'function' &&
+                    String(value).indexOf('.get(') !== -1 &&
+                    /\.data\)?$/.test(String(value));
+                const siteApi = async (isRoute) => {
+                    const find = async () => {
+                        const main = document.querySelector($MAIN_MODULE_SELECTOR_JS);
+                        if (!main || !main.src) return null;
+                        const directory = main.src.slice(0, main.src.lastIndexOf('/') + 1);
+                        const loaded = performance.getEntriesByType('resource')
+                            .map((entry) => entry.name)
+                            .filter((url) => url.indexOf(directory) === 0 && /\.js(\?|$)/.test(url));
+                        const members = [];
+                        for (const url of new Set([main.src, ...loaded])) {
+                            let exported;
+                            try {
+                                exported = await importModule(url);
+                            } catch (e) {
+                                continue;
+                            }
+                            for (const value of Object.values(exported)) {
+                                if (value && typeof value === 'object') members.push(...Object.values(value));
+                            }
+                            const route = members
+                                .filter((group) => group && typeof group === 'object')
+                                .flatMap((group) => Object.values(group))
+                                .find(isRoute);
+                            const get = members.find(isGet);
+                            if (route && get) return (id, params) => get(route(id), { params: params });
+                        }
+                        return null;
+                    };
+                    const deadline = Date.now() + $SITE_API_WAIT_MS;
+                    for (;;) {
+                        if (document.readyState === 'complete') {
+                            const api = await find();
+                            if (api) return api;
+                        }
+                        if (Date.now() >= deadline) return null;
+                        await sleep(250);
+                    }
+                };
+                const CAPTCHA = {};
+                const untilSettled = (call) => {
+                    let timer = null;
+                    const captcha = new Promise((resolve) => {
+                        timer = setInterval(() => {
+                            if (isSiteCaptcha()) resolve(CAPTCHA);
+                        }, 250);
+                    });
+                    return Promise.race([call, captcha]).finally(() => clearInterval(timer));
+                };
+                const failure = (e, what) => {
+                    const status = e && e.response && e.response.status;
+                    if (status === 502) return blockedResult();
+                    return JSON.stringify({
+                        error: what + ' failed: ' + (status ? 'HTTP ' + status : String((e && e.message) || e))
+                    });
+                };
         """
 
         // Collects the whole chapter list.
         //
-        // Runs against the title page with the site's own module stripped out, so
-        // nothing renders and nothing is clicked. It pulls the signing bundle that
-        // module referenced, takes the api object out of it and asks the chapter
-        // endpoint directly, a hundred at a time.
+        // Runs on the title page and asks the site's API client for one page at a
+        // time, the way the site's own pager does. The site counts chapter requests
+        // made with no click or key press shortly before, and after a few it flags
+        // them (`v=1` and an X-Rt header), which gets the device blocked. keiyoushi
+        // sends a real swipe before each request; a parser cannot, so each request
+        // carries the flag the site sends right after a tap (`v=0`), which also
+        // keeps the site from counting it. The site's request signing then rewrites
+        // `v` the same way for these requests as for the page's own.
         //
-        // The result crosses back as a URL fragment, so it is emitted in a compact
-        // form — the shared URL prefix and the scanlation groups are sent once and
-        // referenced by index, and absent fields are omitted:
+        // The result crosses back in a URL, so it is emitted in a compact form — the
+        // shared URL prefix and the scanlation groups are sent once and referenced by
+        // index, and absent fields are omitted:
         //   prefix  shared start of every chapter URL
         //   groups  [{ id?, name?, o }] — o = 1 when the group's release is official
         //   items   [{ i: id, n: number, u: url suffix, g: group index,
         //              v: volume?, t: name?, c: epoch seconds?, d: relative date? }]
-        private fun chapterScript(mangaId: String, knownEnvUrl: String) = """
+        private fun chapterScript(mangaId: String) = """
             (async () => {
 $CLOUDFLARE_DETECT_JS
                 if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
                 if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
-
+                if (isBadGateway()) return blockedResult();
+$SITE_API_JS
                 const MANGA_ID = $mangaId;
-                // Reused from an earlier load when we have it: resolving it means
-                // downloading the whole main bundle to read one filename out of it.
-                const KNOWN_ENV_URL = $knownEnvUrl;
-                // Kotatsu refreshes the whole list, so there is no known chapter to
-                // stop at; the field is kept so the loop matches the site's own.
-                const LATEST_CHAPTER_ID = null;
+                const CHAPTER_PATH = '/title/' + MANGA_ID + '-';
+                const isChapter = (item) => item &&
+                    typeof item.id === 'number' &&
+                    typeof item.number === 'number' &&
+                    typeof item.url === 'string' &&
+                    item.url.indexOf(CHAPTER_PATH) !== -1;
 
-                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-                try {
-                    let envUrl = KNOWN_ENV_URL;
-                    if (!envUrl) {
-                        // The module tag is in the served HTML, so this only ever waits
-                        // for the document to be parsed.
-                        let mainScript = null;
-                        for (let i = 0; i < $BUNDLE_WAIT_TICKS; i++) {
-                            if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
-                            if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
-                            mainScript = document.querySelector($MAIN_MODULE_SELECTOR_JS);
-                            if (mainScript && mainScript.src) break;
-                            await sleep(100);
-                        }
-                        if (!mainScript || !mainScript.src) return null;
-
-                        const mainResponse = await fetch(mainScript.src);
-                        if (!mainResponse.ok) throw new Error('Could not load main bundle');
-                        const mainJavaScript = await mainResponse.text();
-                        const environmentFile = mainJavaScript.match(
-                            /from\s*["']\.\/(env-[^"']+\.js)["']/
-                        );
-                        if (!environmentFile) throw new Error('Could not find environment bundle');
-                        envUrl = new URL(environmentFile[1], mainScript.src).href;
-                    }
-
-                    // A bare import() in an injected script is parsed in the wrong
-                    // context; going through Function keeps it a real dynamic import.
-                    const importBundle = new Function('url', 'return import(url)');
-                    const environment = await importBundle(envUrl);
-                    const mangaApi = Object.values(environment).find((value) =>
-                        value &&
-                        typeof value === 'object' &&
-                        typeof value.chapters === 'function'
-                    );
-                    if (!mangaApi) throw new Error('Could not find manga API');
-
-                    const askFor = (page) => mangaApi.chapters(MANGA_ID, {
-                        page: page,
-                        limit: 100,
-                        order: { number: 'desc' }
-                    });
-                    const rowsOf = (response) => response && (response.items ||
-                        (response.result && response.result.items));
-
-                    const collected = [];
-                    const first = await askFor(1);
-                    const firstItems = rowsOf(first);
-                    if (!Array.isArray(firstItems)) throw new Error('Unexpected chapter response');
-                    collected.push(...firstItems);
-
-                    // The first response says how many pages there are, so the rest do
-                    // not have to be discovered one at a time: they go out together and
-                    // the list arrives in two round trips instead of one per hundred.
-                    const meta = first.meta || first.pagination || {};
-                    const lastPage = Math.min(
-                        meta.lastPage || meta.last_page || 1,
-                        $MAX_CHAPTER_API_PAGES
-                    );
-                    const reachedKnown = firstItems.some((item) => item.id === LATEST_CHAPTER_ID);
-
-                    if (!reachedKnown && firstItems.length > 0 && lastPage > 1) {
-                        let nextPage = 2;
-                        const worker = async () => {
-                            for (;;) {
-                                const page = nextPage++;
-                                if (page > lastPage) return;
-                                const items = rowsOf(await askFor(page));
-                                if (Array.isArray(items)) collected.push(...items);
-                            }
-                        };
-                        await Promise.all(
-                            Array.from(
-                                { length: Math.min($CHAPTER_API_CONCURRENCY, lastPage - 1) },
-                                worker
-                            )
-                        );
-                    } else if (!reachedKnown && meta.hasNext) {
-                        // No page count to fan out over, so walk it the slow way.
-                        let page = 2;
-                        while (page <= $MAX_CHAPTER_API_PAGES) {
-                            const response = await askFor(page);
-                            const items = rowsOf(response);
-                            if (!Array.isArray(items) || items.length === 0) break;
-                            collected.push(...items);
-                            if (items.some((item) => item.id === LATEST_CHAPTER_ID)) break;
-                            const pageMeta = response.meta || response.pagination || {};
-                            if (!pageMeta.hasNext) break;
-                            page++;
-                        }
-                    }
-
-                    // --- Compact the result for the fragment-URL trip back. ---
-                    let prefix = collected.length ? String(collected[0].url || '') : '';
-                    for (const chapter of collected) {
-                        const url = String(chapter.url || '');
-                        let i = 0;
-                        while (i < prefix.length && i < url.length && prefix[i] === url[i]) i++;
-                        prefix = prefix.slice(0, i);
-                    }
-
-                    const groups = [];
-                    const groupIndex = new Map();
-                    const items = collected.map((chapter) => {
-                        const group = chapter.group || null;
-                        const official = chapter.isOfficial ? 1 : 0;
-                        const groupId = group && group.id != null ? group.id : null;
-                        const groupName = group && group.name
-                            ? group.name
-                            : (official ? 'Official' : null);
-                        const key = (groupId != null ? 'i' + groupId : 'n' + (groupName || '')) +
-                            '|' + official;
-                        let g = groupIndex.get(key);
-                        if (g === undefined) {
-                            g = groups.length;
-                            groupIndex.set(key, g);
-                            const entry = { o: official };
-                            if (groupId != null) entry.id = groupId;
-                            if (groupName) entry.name = groupName;
-                            groups.push(entry);
-                        }
-                        const row = {
-                            i: chapter.id,
-                            n: typeof chapter.number === 'number'
-                                ? chapter.number
-                                : Number(chapter.number) || 0,
-                            u: String(chapter.url || '').slice(prefix.length),
-                            g: g
-                        };
-                        if (chapter.volume != null) row.v = chapter.volume;
-                        if (chapter.name) row.t = chapter.name;
-                        if (typeof chapter.createdAt === 'number') row.c = chapter.createdAt;
-                        else if (chapter.createdAtFormatted) row.d = chapter.createdAtFormatted;
-                        return row;
-                    });
-
-                    return JSON.stringify({
-                        prefix: prefix,
-                        groups: groups,
-                        items: items,
-                        empty: items.length === 0,
-                        env: envUrl
-                    });
-                } catch (error) {
-                    return JSON.stringify({
-                        error: String((error && error.message) || error)
-                    });
+                const chapterPage = await siteApi((route) => typeof route === 'function' &&
+                    /^\(?[\w$]+\)?=>`\/manga\/\$\{[\w$]+\}\/chapters`$/.test(String(route)));
+                if (!chapterPage) {
+                    if (isBadGateway()) return blockedResult();
+                    return JSON.stringify({ error: "Could not find the site's chapters API" });
                 }
+
+                // The page asks for the first page itself as it loads; ours go out after
+                // it, one interval apart.
+                let lastRequest = Math.max(performance.now(), 1500);
+                const pace = async () => {
+                    const wait = lastRequest + $CHAPTER_PAGE_INTERVAL_MS - performance.now();
+                    if (wait > 0) await sleep(wait);
+                    lastRequest = performance.now();
+                };
+
+                const collected = [];
+                let total = null;
+                for (let page = 1; page <= $MAX_CHAPTER_API_PAGES; page++) {
+                    await pace();
+                    let result;
+                    try {
+                        result = await untilSettled(chapterPage(MANGA_ID, {
+                            page: page,
+                            limit: $CHAPTER_PAGE_LIMIT,
+                            order: { number: 'desc' },
+                            v: '0'
+                        }));
+                    } catch (e) {
+                        if (isSiteCaptcha()) return '$SITE_CAPTCHA';
+                        return failure(e, 'Chapter page ' + page);
+                    }
+                    if (result === CAPTCHA) return '$SITE_CAPTCHA';
+                    const items = result && result.items;
+                    const meta = result && result.meta;
+                    if (!Array.isArray(items) || !items.every(isChapter) || !meta) {
+                        return JSON.stringify({
+                            error: 'Chapter page ' + page + " came back in a shape the parser doesn't recognise"
+                        });
+                    }
+                    collected.push(...items);
+                    if (typeof meta.total === 'number') total = meta.total;
+                    const lastPage = meta.lastPage || meta.last_page || page;
+                    if (items.length === 0 || meta.hasNext === false || page >= lastPage) break;
+                }
+
+                // --- Compact the result for the trip back. ---
+                const unique = new Map();
+                for (const chapter of collected) unique.set(chapter.id, chapter);
+                const list = Array.from(unique.values());
+                let prefix = list.length ? String(list[0].url || '') : '';
+                for (const chapter of list) {
+                    const url = String(chapter.url || '');
+                    let i = 0;
+                    while (i < prefix.length && i < url.length && prefix[i] === url[i]) i++;
+                    prefix = prefix.slice(0, i);
+                }
+
+                const groups = [];
+                const groupIndex = new Map();
+                const items = list.map((chapter) => {
+                    const group = chapter.group || null;
+                    const official = chapter.isOfficial ? 1 : 0;
+                    const groupId = group && group.id != null ? group.id : null;
+                    const groupName = group && group.name
+                        ? group.name
+                        : (official ? 'Official' : null);
+                    const key = (groupId != null ? 'i' + groupId : 'n' + (groupName || '')) +
+                        '|' + official;
+                    let g = groupIndex.get(key);
+                    if (g === undefined) {
+                        g = groups.length;
+                        groupIndex.set(key, g);
+                        const entry = { o: official };
+                        if (groupId != null) entry.id = groupId;
+                        if (groupName) entry.name = groupName;
+                        groups.push(entry);
+                    }
+                    const row = {
+                        i: chapter.id,
+                        n: chapter.number,
+                        u: String(chapter.url || '').slice(prefix.length),
+                        g: g
+                    };
+                    if (chapter.volume != null) row.v = chapter.volume;
+                    if (chapter.name) row.t = chapter.name;
+                    if (typeof chapter.createdAt === 'number') row.c = chapter.createdAt;
+                    else if (chapter.createdAtFormatted) row.d = chapter.createdAtFormatted;
+                    return row;
+                });
+
+                return JSON.stringify({
+                    prefix: prefix,
+                    groups: groups,
+                    items: items,
+                    total: total,
+                    empty: items.length === 0
+                });
             })()
         """
 
-        // Browse results arrive via a signed, encrypted XHR the page decrypts in
-        // JS, so we hook `JSON.parse` (catches the decrypted object), `fetch` and
-        // `XMLHttpRequest` (catch plain responses), plus poll `script#initial-data`
-        // as a backstop. Resolves with the first `{ result: { items: [...] } }`
-        // payload as a compact JSON string for the bridge to hand back. Browse
-        // responses include many fields the listing never consumes, especially
-        // dozens of translated alternate titles per item; carrying those through
-        // a WebView navigation and then into Manga objects causes avoidable delay.
+        // The browse results arrive over a signed, encoded XHR the page decodes
+        // itself; [SITE_HOOKS_JS] records the decoded payload, and this waits for a
+        // list of titles to show up there (or in `script#initial-data`). Resolves with
+        // `{ result: { items: [...] } }` as a compact JSON string for the bridge to
+        // hand back. Browse responses include many fields the listing never
+        // consumes, especially dozens of translated alternate titles per item;
+        // carrying those back and into Manga objects causes avoidable delay.
         private const val BROWSE_CAPTURE_SCRIPT = """
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
                 if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
                 if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
-                const original = JSON.parse;
-                let captured = null;
+                if (isBadGateway()) return blockedResult();
                 const compactNamedItems = (values) => {
                     if (!Array.isArray(values)) return undefined;
                     return values.map((value) => {
@@ -1360,125 +1605,98 @@ $CLOUDFLARE_DETECT_JS
                     if (authors && authors.length) result.authors = authors;
                     return result;
                 };
-                const take = (obj) => {
-                    if (captured) return true;
-                    try {
-                        const items = obj && obj.result && obj.result.items;
-                        if (Array.isArray(items) && items.length > 0) {
-                            captured = JSON.stringify({ result: { items: items.map(compactItem) } });
-                            return true;
-                        }
-                    } catch (e) {}
-                    return false;
-                };
-                JSON.parse = function () {
-                    const parsed = original.apply(this, arguments);
-                    take(parsed);
-                    return parsed;
-                };
-                if (typeof window.fetch === 'function') {
-                    const originalFetch = window.fetch;
-                    window.fetch = function () {
-                        return originalFetch.apply(this, arguments).then((response) => {
-                            try {
-                                response.clone().text().then((text) => {
-                                    try { take(original(text)); } catch (e) {}
-                                }).catch(() => {});
-                            } catch (e) {}
-                            return response;
-                        });
-                    };
-                }
-                const originalSend = XMLHttpRequest.prototype.send;
-                XMLHttpRequest.prototype.send = function () {
-                    this.addEventListener('load', function () {
-                        try { take(original(this.responseText)); } catch (e) {}
-                    });
-                    return originalSend.apply(this, arguments);
-                };
+                const isManga = (item) => item && typeof item === 'object' &&
+                    !!(item.hid || item.hash_id) && typeof item.title === 'string';
+                // A paginated list of titles. An empty one is a search with no match
+                // or a page past the end; the browse page loads no other paged list.
+                const isList = (holder) => holder && Array.isArray(holder.items) && (
+                    holder.items.length > 0
+                        ? holder.items.every(isManga)
+                        : !!holder.meta && typeof holder.meta === 'object'
+                );
+                const found = (holder) => JSON.stringify({ result: { items: holder.items.map(compactItem) } });
+                // A search only takes a list asked for with its keyword. A plain listing
+                // also falls back to any decoded list, should the response itself not
+                // be readable.
+                const keyword = (new URL(location.href).searchParams.get('keyword') || '').trim();
                 for (let i = 0; i < 300; i++) {
-                    if (captured) return captured;
-                    if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
-                    if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
+                    const lists = window.__comixLists || [];
+                    for (let k = lists.length - 1; k >= 0; k--) {
+                        if (lists[k].keyword === keyword && isList(lists[k].holder)) return found(lists[k].holder);
+                    }
+                    const seen = window.__comixSeen || [];
+                    for (let k = seen.length - 1; k >= 0 && !keyword; k--) {
+                        if (isList(seen[k])) return found(seen[k]);
+                    }
                     try {
                         const node = document.querySelector('script#initial-data');
-                        if (node && node.textContent) {
-                            const queries = original(node.textContent).queries;
-                            if (queries) {
-                                for (const k in queries) {
-                                    if (take(queries[k]) || take({ result: queries[k] })) break;
-                                }
+                        const queries = node && node.textContent && JSON.parse(node.textContent).queries;
+                        if (queries) {
+                            for (const k in queries) {
+                                const value = queries[k];
+                                const holder = value && (Array.isArray(value.items) ? value : value.result);
+                                if (isList(holder) && holder.items.length > 0) return found(holder);
                             }
                         }
                     } catch (e) {}
+                    if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
+                    if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
+                    if (isSiteCaptcha()) return '$SITE_CAPTCHA';
+                    if (isBadGateway()) return blockedResult();
                     await sleep(100);
                 }
                 return JSON.stringify({ error: 'no browse data captured' });
             })()
         """
 
-        // Same capture technique, for the reader page's page list, recognised by
-        // a `result.pages` object. Resolves with `{ result: { pages: ... } }`.
-        private const val PAGE_CAPTURE_SCRIPT = """
+        // The reader's page list, from the site's chapter endpoint through its API
+        // client (after keiyoushi's chapter_pages.js). Resolves with
+        // `{ result: { pages: { baseUrl, items, alt, node } } }`.
+        private fun pageScript(chapterId: String) = """
             (async () => {
-                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
                 if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
                 if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
-                const original = JSON.parse;
-                let captured = null;
-                const take = (obj) => {
-                    if (captured) return true;
-                    try {
-                        const result = obj && obj.result ? obj.result : obj;
-                        if (result && result.pages) {
-                            captured = JSON.stringify({ result: result });
-                            return true;
+                if (isBadGateway()) return blockedResult();
+$SITE_API_JS
+                const CHAPTER_ID = $chapterId;
+                const isImage = (item) => item && typeof item === 'object' &&
+                    typeof item.url === 'string' && !item.hid && !item.title && item.number === undefined;
+                const isPages = (value) => value && !value.meta &&
+                    Array.isArray(value.items) && value.items.length > 0 && value.items.every(isImage);
+                const found = (holder) => JSON.stringify({
+                    result: {
+                        pages: {
+                            baseUrl: holder.baseUrl || '',
+                            items: holder.items.map((item) => item.s != null ? { url: item.url, s: item.s } : { url: item.url }),
+                            alt: Array.isArray(holder.alt) ? holder.alt : undefined,
+                            node: holder.node || undefined
                         }
-                    } catch (e) {}
-                    return false;
-                };
-                JSON.parse = function () {
-                    const parsed = original.apply(this, arguments);
-                    take(parsed);
-                    return parsed;
-                };
-                if (typeof window.fetch === 'function') {
-                    const originalFetch = window.fetch;
-                    window.fetch = function () {
-                        return originalFetch.apply(this, arguments).then((response) => {
-                            try {
-                                response.clone().text().then((text) => {
-                                    try { take(original(text)); } catch (e) {}
-                                }).catch(() => {});
-                            } catch (e) {}
-                            return response;
-                        });
-                    };
+                    }
+                });
+
+                const chapter = await siteApi((route) => typeof route === 'function' &&
+                    /^\(?[\w$]+\)?=>`\/chapters\/\$\{[\w$]+\}`$/.test(String(route)));
+                if (!chapter) {
+                    if (isBadGateway()) return blockedResult();
+                    return JSON.stringify({ error: "Could not find the site's chapter API" });
                 }
-                const originalSend = XMLHttpRequest.prototype.send;
-                XMLHttpRequest.prototype.send = function () {
-                    this.addEventListener('load', function () {
-                        try { take(original(this.responseText)); } catch (e) {}
-                    });
-                    return originalSend.apply(this, arguments);
-                };
-                for (let i = 0; i < 300; i++) {
-                    if (captured) return captured;
-                    if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
-                    if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
-                    try {
-                        const node = document.querySelector('script#initial-data');
-                        if (node && node.textContent) {
-                            const queries = original(node.textContent).queries;
-                            if (queries) {
-                                for (const k in queries) { if (take(queries[k])) break; }
-                            }
-                        }
-                    } catch (e) {}
-                    await sleep(100);
+                let result;
+                try {
+                    result = await untilSettled(chapter(CHAPTER_ID));
+                } catch (e) {
+                    if (isSiteCaptcha()) return '$SITE_CAPTCHA';
+                    return failure(e, 'Chapter pages');
                 }
-                return JSON.stringify({ error: 'no page data captured' });
+                if (result === CAPTCHA) return '$SITE_CAPTCHA';
+                // The site's reader takes the pages either as an object or as a bare array.
+                const pages = [result, ...Object.values(result || {})]
+                    .map((value) => Array.isArray(value) ? { items: value } : value)
+                    .find(isPages);
+                if (!pages) {
+                    return JSON.stringify({ error: "Chapter pages came back in a shape the parser doesn't recognise" });
+                }
+                return found(pages);
             })()
         """
 

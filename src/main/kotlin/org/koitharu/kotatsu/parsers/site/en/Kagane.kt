@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.all
 
+import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
@@ -15,6 +17,7 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import java.math.BigInteger
 import java.net.URI
 import java.nio.ByteBuffer
@@ -32,7 +35,8 @@ import javax.crypto.spec.SecretKeySpec
 internal class Kagane(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.KAGANE, pageSize = 35) {
 
-    override val configKeyDomain = ConfigKey.Domain("kagane.to")
+    // kagane.to stopped resolving when the site moved to kagane.org.
+    override val configKeyDomain = ConfigKey.Domain("kagane.org")
 
     // The API used to live on its own `yuzuki.` host; that name no longer
     // resolves at all. It is served from the site domain now, so read it through
@@ -461,14 +465,7 @@ internal class Kagane(context: MangaLoaderContext) :
                 ?: JSONArray(),
         )
         if (chapters.isEmpty()) {
-            val chaptersUrl = "$apiUrl/api/v2/series/$seriesId/books/list"
-            val chapterResp = webClient.httpGet(chaptersUrl, headers).parseJson()
-            chapters = parseChapters(
-                chapterResp.optJSONArray("series_books")
-                    ?: chapterResp.optJSONArray("seriesBooks")
-                    ?: chapterResp.optJSONArray("content")
-                    ?: JSONArray(),
-            )
+            chapters = parseChapters(fetchSeriesBooks(seriesId, headers))
         }
 
         return manga.copy(
@@ -482,6 +479,38 @@ internal class Kagane(context: MangaLoaderContext) :
             chapters = chapters,
             contentRating = parseContentRating(json.optString("content_rating")) ?: manga.contentRating,
         )
+    }
+
+    // Since the October 2026 site update the series details no longer embed
+    // `series_books`; chapters come from a separate cursor-paginated endpoint.
+    // Results are ascending by default and `before=<next_cursor>` returns the
+    // following page, despite the name.
+    private suspend fun fetchSeriesBooks(seriesId: String, headers: Headers): JSONArray {
+        val books = JSONArray()
+        val seenCursors = HashSet<String>()
+        var cursor: String? = null
+        do {
+            val url = "$apiUrl/api/v2/series/$seriesId/books".toHttpUrl().newBuilder()
+                .addQueryParameter("limit", "500")
+                .apply { cursor?.let { addQueryParameter("before", it) } }
+                .build()
+            val page = webClient.httpGet(url, headers).parseJson()
+            val items = page.optJSONArray("items") ?: break
+            for (i in 0 until items.length()) {
+                books.put(items.get(i))
+            }
+            cursor = page.getStringOrNull("next_cursor")
+        } while (cursor != null && seenCursors.add(cursor))
+        return books
+    }
+
+    // Manga.url is the bare series id, not the "/series/<id>" path of the link.
+    override suspend fun resolveLink(resolver: LinkResolver, link: HttpUrl): Manga? {
+        if (link.host != domain) return null
+        val segments = link.pathSegments
+        if (segments.firstOrNull() != "series") return null
+        val seriesId = segments.getOrNull(1)?.takeIf { UUID_REGEX.matches(it) } ?: return null
+        return resolver.resolveManga(this, url = seriesId)
     }
 
     override suspend fun getRelatedManga(seed: Manga): List<Manga> {

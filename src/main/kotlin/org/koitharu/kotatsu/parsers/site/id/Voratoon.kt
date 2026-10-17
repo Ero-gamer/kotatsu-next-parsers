@@ -18,18 +18,19 @@ import java.util.concurrent.ConcurrentHashMap
 internal class Voratoon(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.VORATOON, pageSize = 30) {
 
-	override val configKeyDomain = ConfigKey.Domain("api.voratoon.com", "v1.voratoon.com")
+	// Web frontend domain (moves often). The JSON API stays on API_DOMAIN.
+	override val configKeyDomain = ConfigKey.Domain("v8.voratoon.com", "v7.voratoon.com", "v6.voratoon.com")
 
 	override suspend fun getFavicons(): Favicons {
 		return Favicons(
 			listOf(
 				Favicon(
-					url = "https://v1.voratoon.com/icon.png",
-					size = 512,
+					url = "https://$domain/icon.png",
+					size = 64,
 					rel = null,
 				),
 			),
-			referer = "https://v1.voratoon.com",
+			referer = "https://$domain",
 		)
 	}
 
@@ -44,7 +45,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 		isSearchSupported = true,
 		isMultipleTagsSupported = true,
 		isTagsExclusionSupported = false,
-		isSearchWithFiltersSupported = false,
+		isSearchWithFiltersSupported = true,
 		isYearSupported = false,
 	)
 
@@ -53,7 +54,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
 		tagsCache["all"]?.let { return it }
 		return runCatching {
-			val json = webClient.httpGet("https://$domain/genres").parseJson()
+			val json = webClient.httpGet("https://$API_DOMAIN/genres").parseJson()
 			val arr = json.optJSONArray("data") ?: return@runCatching emptySet<MangaTag>()
 			val tags = LinkedHashSet<MangaTag>(arr.length())
 			for (i in 0 until arr.length()) {
@@ -86,7 +87,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val sort = when (order) {
 			SortOrder.UPDATED -> "latest"
-			SortOrder.POPULARITY -> "totalViews"
+			SortOrder.POPULARITY -> "popularity"
 			SortOrder.RATING -> "rating"
 			SortOrder.ALPHABETICAL -> "title"
 			else -> "latest"
@@ -97,7 +98,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 	}
 
 	private fun buildListUrl(page: Int, sort: String, filter: MangaListFilter): String = buildString {
-		append("https://").append(domain).append("/series")
+		append("https://").append(API_DOMAIN).append("/series")
 		append("?take=").append(pageSize)
 		append("&page=").append(page)
 		append("&sort=").append(sort)
@@ -107,17 +108,18 @@ internal class Voratoon(context: MangaLoaderContext) :
 		filter.query?.takeIf { it.isNotBlank() }?.let {
 			append("&title=").append(it.urlEncoded())
 		}
-		// API accepts a single genre value only
-		filter.tags.firstOrNull()?.let {
-			append("&filter=genreIds%3D%3D").append(it.key.urlEncoded())
+		// RSQL-like expression in a single param: ';' is AND, '=in=(a,b)' is OR.
+		// A repeated 'filter' param is not combined by the API.
+		val conditions = ArrayList<String>()
+		filter.tags.mapTo(conditions) { "genreIds==${it.key}" }
+		if (filter.types.isNotEmpty()) {
+			conditions += filter.types.joinToString(",", "format=in=(", ")") { it.name.lowercase() }
 		}
-		// API accepts a single format value only
-		filter.types.firstOrNull()?.let {
-			append("&filter=format%3D%3D").append(it.name.lowercase())
+		if (filter.states.isNotEmpty()) {
+			conditions += filter.states.joinToString(",", "status=in=(", ")") { it.toApiValue() }
 		}
-		// API accepts a single status value only
-		filter.states.firstOrNull()?.let {
-			append("&filter=status%3D%3D").append(it.toApiValue())
+		if (conditions.isNotEmpty()) {
+			append("&filter=").append(conditions.joinToString(";").urlEncoded())
 		}
 	}
 
@@ -131,6 +133,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 		val chapters = chaptersDeferred.await().optJSONArray("data")
 		manga.copy(
 			title = data.optString("title").ifBlank { manga.title },
+			publicUrl = "https://$domain/series/$slug",
 			altTitles = setOfNotNull(data.optString("nativeTitle").ifBlank { null }),
 			coverUrl = data.optString("coverImage").ifEmpty { manga.coverUrl },
 			largeCoverUrl = data.optString("backgroundImage").ifEmpty { null },
@@ -145,7 +148,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val parts = chapter.url.trim('/').split('/')
-		if (parts.size < 4 || parts[0] != "series" || parts[2] != "chapters") {
+		if (parts.size < 4 || parts[0] != "series" || (parts[2] != "chapters" && parts[2] != "chapter")) {
 			return error("Voratoon: invalid chapter url: ${chapter.url}")
 		}
 		val slug = parts[1]
@@ -160,13 +163,13 @@ internal class Voratoon(context: MangaLoaderContext) :
 	}
 
 	private fun buildDetailsUrl(slug: String): String = buildString {
-		append("https://").append(domain).append("/series")
+		append("https://").append(API_DOMAIN).append("/series")
 		append("?take=1&page=1&includeMeta=true&takeChapter=1")
 		append("&filter=slug%3D%3D").append(slug.urlEncoded())
 	}
 
 	private fun buildChaptersUrl(slug: String): String =
-		"https://$domain/series/${slug.urlEncoded()}/chapters"
+		"https://$API_DOMAIN/series/${slug.urlEncoded()}/chapters"
 
 	private suspend fun fetchChapterPages(slug: String, chapterNumber: String): List<MangaPage> {
 		val url = "${buildChaptersUrl(slug)}/${chapterNumber.urlEncoded()}"
@@ -210,7 +213,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 			title = data.optString("title").ifBlank { "Untitled" },
 			altTitles = setOfNotNull(data.optString("nativeTitle").ifBlank { null }),
 			url = "/series/$slug",
-			publicUrl = "https://v1.voratoon.com/series/$slug",
+			publicUrl = "https://$domain/series/$slug",
 			rating = data.optDouble("rating", 0.0).let { if (it > 0f) it.toFloat() / 10f else RATING_UNKNOWN },
 			contentRating = ContentRating.SAFE,
 			coverUrl = data.optString("coverImage").ifEmpty { null },
@@ -244,7 +247,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 					title = "Chapter $chapterNumber",
 					number = number,
 					volume = 0,
-					url = "/series/$slug/chapters/$chapterNumber",
+					url = "/series/$slug/chapter/$chapterNumber",
 					scanlator = null,
 					uploadDate = parseChapterDate(jo.optString("createdAt")),
 					branch = null,
@@ -297,7 +300,7 @@ internal class Voratoon(context: MangaLoaderContext) :
 		"ongoing" -> MangaState.ONGOING
 		"completed" -> MangaState.FINISHED
 		"hiatus" -> MangaState.PAUSED
-		"canceled" -> MangaState.ABANDONED
+		"cancelled", "canceled" -> MangaState.ABANDONED
 		else -> null
 	}
 
@@ -305,12 +308,17 @@ internal class Voratoon(context: MangaLoaderContext) :
 		MangaState.ONGOING -> "ongoing"
 		MangaState.FINISHED -> "completed"
 		MangaState.PAUSED -> "hiatus"
-		MangaState.ABANDONED -> "canceled"
+		MangaState.ABANDONED -> "cancelled"
 		else -> ""
 	}
 
 	private fun parseAuthors(author: String): Set<String> {
 		if (author.isBlank()) return emptySet()
 		return setOf(author.trim())
+	}
+
+	private companion object {
+
+		const val API_DOMAIN = "api.voratoon.com"
 	}
 }

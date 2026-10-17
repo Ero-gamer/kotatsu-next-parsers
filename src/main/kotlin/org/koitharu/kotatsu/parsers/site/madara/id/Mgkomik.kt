@@ -22,8 +22,10 @@ internal class Mgkomik(context: MangaLoaderContext) :
 	override val datePattern = "dd MMM yy"
 	override val stylePage = ""
 	override val sourceLocale: Locale = Locale.ENGLISH
+
+	// Cloudflare's WAF refuses admin-ajax.php outright; the plain list pages and
+	// /ajax/chapters/ only get its regular challenge, which the app solves.
 	override val withoutAjax = true
-	override val postReq = true
 
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
 		.add("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")

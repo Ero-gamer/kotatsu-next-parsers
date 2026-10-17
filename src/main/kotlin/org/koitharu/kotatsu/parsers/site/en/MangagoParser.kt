@@ -3,6 +3,7 @@ package org.koitharu.kotatsu.parsers.site.en
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.bitmap.Bitmap
@@ -160,6 +161,10 @@ internal class MangagoParser(context: MangaLoaderContext) :
             val title = linkElement.attr("title").ifEmpty {
                 linkElement.selectFirst("h2 a")?.text() ?: return@mapNotNull null
             }
+            // Removed uploads are filed under a "DELETE" title, which the site's own search leaves out
+            if (title == DELETED_UPLOADS_TITLE && DELETED_UPLOADS_URL_REGEX.containsMatchIn(href)) {
+                return@mapNotNull null
+            }
             val thumbnailElem = linkElement.selectFirst("img") ?: return@mapNotNull null
             val thumbnailUrl = thumbnailElem.attr("abs:data-src").ifEmpty {
                 thumbnailElem.attr("abs:src")
@@ -181,11 +186,11 @@ internal class MangagoParser(context: MangaLoaderContext) :
                 contentRating = ContentRating.SAFE,
                 source = source,
             )
-        }
+        }.distinctBy { it.url } // desktop pages nest .box inside .pic_list > li, both match
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
-        val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+        val doc = loadDetailsPage(manga.url.toAbsoluteUrl(domain))
         val infoBlock = doc.requireElementById("information")
 
         val title = doc.selectFirstOrThrow(".w-title h1").text()
@@ -239,10 +244,46 @@ internal class MangagoParser(context: MangaLoaderContext) :
         val scanlator: String?,
     )
 
+    /**
+     * Titles that the site also offers on its partner reader get their chapter links rewritten on a random share of
+     * the title pages it serves (about half of them for some titles, in both layouts): every link then points at a
+     * partner host, `www.mangago.zone/chapter/84380/2382390/` or `www.youhim.me/chapter/84380/2382390/` (the host
+     * picked per link), instead of the site's own reader, `www.mangago.me/read-manga/<slug>/uu/nml_chapter-45/pg-1/`.
+     * Nothing in the page ties the two forms together and chapter ids are made from the link, so taking such a page
+     * gives every chapter of the title another id for that load, and the app loses the reading position (and the
+     * branch it was read in). Ask again until the links are the site's own ones, then make do with the last page.
+     */
+    private suspend fun loadDetailsPage(url: String): Document {
+        var doc = webClient.httpGet(url).parseHtml()
+        var attempts = 1
+        while (attempts < DETAILS_PAGE_ATTEMPTS && doc.hasPartnerChapterLinks()) {
+            doc = webClient.httpGet(url).parseHtml()
+            attempts++
+        }
+        return doc
+    }
+
+    private fun Document.chapterRows() = select("table#chapter_table > tbody > tr, table.uk-table > tbody > tr")
+
+    private fun Element.chapterLink(): Element? = selectFirst("a.chico")
+
+    private fun Document.hasPartnerChapterLinks(): Boolean = chapterRows().any { row ->
+        row.chapterLink()?.attrAsAbsoluteUrlOrNull("href")?.let(::partnerChapterPath) != null
+    }
+
+    /** `/chapter/<title>/<chapter>/` for a link to the partner reader, null for the site's own reader. */
+    private fun partnerChapterPath(url: String): String? = PARTNER_CHAPTER_REGEX.find(url)?.groupValues?.get(1)
+
+    /**
+     * What a chapter id is made from: the link, without its host when it goes to the partner reader since that
+     * host is picked at random on every load. Links to the site's own reader are kept whole, as ids always were.
+     */
+    private fun chapterKey(url: String): String = partnerChapterPath(url) ?: url
+
     private fun parseChapterList(doc: Document): List<MangaChapter> {
-        val rawChapters = doc.select("table#chapter_table > tbody > tr, table.uk-table > tbody > tr")
+        val rawChapters = doc.chapterRows()
             .mapNotNull { element ->
-                val link = element.selectFirst("a.chico") ?: return@mapNotNull null
+                val link = element.chapterLink() ?: return@mapNotNull null
                 val url = link.attrAsAbsoluteUrlOrNull("href") ?: return@mapNotNull null
                 val name = link.text().trim()
 
@@ -379,7 +420,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
         for ((index, chapter) in specialChapters.withIndex()) {
             result.add(
                 MangaChapter(
-                    id = generateUid(chapter.url),
+                    id = generateUid(chapterKey(chapter.url)),
                     url = chapter.url,
                     title = chapter.name,
                     number = baseSpecialNumber + index,
@@ -397,10 +438,11 @@ internal class MangagoParser(context: MangaLoaderContext) :
 
     private fun chapterId(chapter: ChapterParseData, branch: String?, primaryBranch: Map<String, String>): Long {
         val primary = primaryBranch[chapter.url]
+        val key = chapterKey(chapter.url)
         return if (primary == null || primary == branch) {
-            generateUid(chapter.url)
+            generateUid(key)
         } else {
-            generateUid("${chapter.url}#$branch")
+            generateUid("$key#$branch")
         }
     }
 
@@ -788,5 +830,9 @@ internal class MangagoParser(context: MangaLoaderContext) :
         private const val UNKNOWN_SCANLATOR = "Unknown"
         private const val OFFICIAL_BRANCH = "Official"
         private val OFFICIAL_REGEX = Regex("""\bofficial\b""", RegexOption.IGNORE_CASE)
+        private val PARTNER_CHAPTER_REGEX = Regex("""^https?://[^/]+(/chapter/\d+/\d+/?)$""")
+        private const val DETAILS_PAGE_ATTEMPTS = 5
+        private const val DELETED_UPLOADS_TITLE = "DELETE"
+        private val DELETED_UPLOADS_URL_REGEX = Regex("""/read-manga/delete_\d+/?$""")
     }
 }

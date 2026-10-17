@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.en
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
@@ -8,6 +9,7 @@ import org.jsoup.HttpStatusException
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
+import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -23,6 +25,7 @@ import org.koitharu.kotatsu.parsers.util.json.getFloatOrDefault
 import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.suspendlazy.getOrNull
 import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -218,27 +221,81 @@ internal class BatCave(context: MangaLoaderContext) :
 			if (System.currentTimeMillis() - lastGuardSolveAt < GUARD_TRUST_WINDOW_MS) {
 				return@withLock true
 			}
-			// The challenge page runs its check and redirects back once the trust cookie is set
-			val script = """
-				(() => new Promise(resolve => {
-					const started = Date.now();
-					const check = () => {
-						if (!location.pathname.startsWith("/_c") || document.cookie.indexOf("$DLE_GUARD_COOKIE=") >= 0) {
-							resolve("ok");
-						} else if (Date.now() - started > 25000) {
-							resolve("timeout");
-						} else {
-							setTimeout(check, 250);
-						}
-					};
-					check();
-				}))();
-			""".trimIndent()
-			runCatchingCancellable { context.evaluateJs(url, script, timeout = 30000L) }
-			hasDleGuardTrust().also { solved ->
-				if (solved) lastGuardSolveAt = System.currentTimeMillis()
+			val solved = runCatchingCancellable { solveDleGuardChallenge(url) }.getOrDefault(false) ||
+				solveDleGuardInWebView(url)
+			if (solved) {
+				lastGuardSolveAt = System.currentTimeMillis()
 			}
+			solved
 		}
+	}
+
+	/**
+	 * The guard page only asks for a SHA-256 proof of work ("<token>:<nonce>" hashing to a "00" prefix)
+	 * posted to /_v, which then sets the trust cookie. Solving it here avoids needing a WebView, whose
+	 * copy of the guard script refuses to run in the app's hidden WebView.
+	 */
+	private suspend fun solveDleGuardChallenge(url: String): Boolean {
+		val request = Request.Builder()
+			.get()
+			.url(url)
+			.tag(MangaSource::class.java, source)
+			.build()
+		val token = context.httpClient.newCall(request).await().use { response ->
+			if (!response.request.url.isDleGuard()) {
+				return true
+			}
+			DLE_GUARD_TOKEN_REGEX.find(response.requireBody().string())?.groupValues?.get(1)
+		} ?: return false
+		val startedAt = System.currentTimeMillis()
+		val digest = MessageDigest.getInstance("SHA-256")
+		val nonce = (0 until DLE_GUARD_MAX_NONCE).firstOrNull { n ->
+			digest.digest("$token:$n".toByteArray())[0] == 0.toByte()
+		} ?: return false
+		val hash = digest.digest("$token:$nonce".toByteArray()).joinToString("") { "%02x".format(it) }
+		// The site rejects answers faster than its own script, which hashes 50 nonces per animation frame
+		delay(maxOf(DLE_GUARD_MIN_WORK_MS, (nonce / 50 + 1) * 17L) - (System.currentTimeMillis() - startedAt))
+		val form = mapOf(
+			"token" to token.urlEncoded(),
+			"mode" to "modern",
+			"workTime" to (System.currentTimeMillis() - startedAt).toString(),
+			"iterations" to (nonce + 1).toString(),
+			"hasCrypto" to "1",
+			"pow_nonce" to nonce.toString(),
+			"pow_hash" to hash,
+			"webdriver" to "0",
+			"touch" to "1",
+			"screen_w" to "412",
+			"screen_h" to "915",
+			"screen_cd" to "24",
+			"tz" to (-TimeZone.getDefault().getOffset(startedAt) / 60_000).toString(),
+			"dpr" to "2.625",
+			"cdp" to "0",
+			"cdpf" to "",
+		)
+		webClient.httpPost("https://$domain/_v".toHttpUrl(), form).close()
+		return hasDleGuardTrust()
+	}
+
+	private suspend fun solveDleGuardInWebView(url: String): Boolean {
+		// The challenge page runs its check and redirects back once the trust cookie is set
+		val script = """
+			(() => new Promise(resolve => {
+				const started = Date.now();
+				const check = () => {
+					if (!location.pathname.startsWith("/_c") || document.cookie.indexOf("$DLE_GUARD_COOKIE=") >= 0) {
+						resolve("ok");
+					} else if (Date.now() - started > 25000) {
+						resolve("timeout");
+					} else {
+						setTimeout(check, 250);
+					}
+				};
+				check();
+			}))();
+		""".trimIndent()
+		runCatchingCancellable { context.evaluateJs(url, script, timeout = 30000L) }
+		return hasDleGuardTrust()
 	}
 
 	private fun hasDleGuardTrust(): Boolean =
@@ -246,8 +303,10 @@ internal class BatCave(context: MangaLoaderContext) :
 
 	private fun HttpUrl.isDleGuard(): Boolean = pathSegments.firstOrNull() == "_c"
 
+	// A page captured from the WebView keeps the requested URL as its location, so also look for the challenge script
 	private fun isDleGuardPage(doc: Document): Boolean =
-		doc.location().toHttpUrlOrNull()?.isDleGuard() == true
+		doc.location().toHttpUrlOrNull()?.isDleGuard() == true ||
+			doc.selectFirst("script:containsData(pow_nonce)") != null
 
 	private fun hasValidBatCaveContent(doc: Document): Boolean {
 		if (isDleGuardPage(doc)) {
@@ -271,6 +330,13 @@ internal class BatCave(context: MangaLoaderContext) :
 			(lower.contains("checking your browser") && lower.contains("cloudflare")) ||
 			lower.contains("cf-browser-verification") ||
 			lower.contains("cf-chl-opt")
+	}
+
+	override suspend fun getFavicons(): Favicons {
+		if (!hasDleGuardTrust()) {
+			solveDleGuard("https://$domain/")
+		}
+		return super.getFavicons()
 	}
 
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
@@ -414,17 +480,8 @@ internal class BatCave(context: MangaLoaderContext) :
 
 		val dateFormat = SimpleDateFormat("dd.MM.yyyy", Locale.US)
 
-		val scriptData = doc.selectFirst("script:containsData(__DATA__)")?.data()
-			?.let { data ->
-				val jsonStart = data.indexOf("window.__DATA__ = ") + "window.__DATA__ = ".length
-				val jsonEnd = data.indexOf("};", startIndex = jsonStart)
-				if (jsonEnd != -1) {
-					// substring, include "}" symbol
-					data.substring(jsonStart, jsonEnd + 1)
-				} else {
-					null
-				}
-			} ?: doc.parseFailed("Script data not found")
+		val scriptData = extractScriptJson(doc, "__DATA__")
+			?: doc.parseFailed("Script data not found")
 
 		val jsonData = JSONObject(scriptData)
 		val newsId = jsonData.getLong("news_id")
@@ -472,6 +529,9 @@ internal class BatCave(context: MangaLoaderContext) :
 		}
 
 		return manga.copy(
+			// Links opened directly only carry a placeholder title and no cover
+			title = doc.selectFirst("header.page__header h1")?.textOrNull() ?: manga.title,
+			coverUrl = manga.coverUrl?.nullIfEmpty() ?: doc.selectFirst("div.page__poster img")?.attrAsAbsoluteUrlOrNull("src"),
 			authors = setOfNotNull(author),
 			state = state,
 			chapters = chapters,
@@ -480,23 +540,66 @@ internal class BatCave(context: MangaLoaderContext) :
 		)
 	}
 
+	/**
+	 * Finds `window.<varName> = {...}` (or `<varName>={...}`, with or without a trailing semicolon)
+	 * in any inline script, or a JSON script tag whose id contains the name, and returns the object
+	 * as a string. Braces are matched properly, so a "};" inside a chapter title can't cut it short.
+	 */
+	private fun extractScriptJson(doc: Document, varName: String): String? {
+		// Only a real assignment of an object literal, not reads like Object.assign({...}, window.__DATA__)
+		val assignment = Regex("""(?:window\.)?${Regex.escape(varName)}\s*=\s*(?=\{)""")
+		for (script in doc.select("script")) {
+			val data = script.data()
+			for (match in assignment.findAll(data)) {
+				extractBalancedObject(data, match.range.last + 1)?.let { return it }
+			}
+		}
+		doc.selectFirst("script[type=application/json][id*=${varName.trim('_')}]")
+			?.data()?.trim()?.takeIf { it.startsWith("{") }
+			?.let { return it }
+		return null
+	}
+
+	private fun extractBalancedObject(text: String, start: Int): String? {
+		var depth = 0
+		var quote = 0.toChar()
+		var escaped = false
+		for (i in start until text.length) {
+			val c = text[i]
+			if (quote != 0.toChar()) {
+				when {
+					escaped -> escaped = false
+					c == '\\' -> escaped = true
+					c == quote -> quote = 0.toChar()
+				}
+				continue
+			}
+			when (c) {
+				'"', '\'' -> quote = c
+				'{' -> depth++
+				'}' -> if (--depth == 0) return text.substring(start, i + 1)
+			}
+		}
+		return null
+	}
+
 	private companion object {
 
 		const val DLE_GUARD_COOKIE = "__guard_trust"
 		const val GUARD_TRUST_WINDOW_MS = 5_000L
+		const val DLE_GUARD_MAX_NONCE = 1_000_000
+		const val DLE_GUARD_MIN_WORK_MS = 50L
+
+		val DLE_GUARD_TOKEN_REGEX = Regex("""\btoken:\s*"([^"]+)"""")
+
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = captureDocument(chapter.url.toAbsoluteUrl(domain))
-		val data = doc.selectFirst("script:containsData(__DATA__)")?.data()
-			?.substringAfter("=")
-			?.trim()
-			?.removeSuffix(";")
-			?.substringAfter("\"images\":[")
-			?.substringBefore("]")
-			?.split(",")
-			?.map { it.trim().removeSurrounding("\"").replace("\\", "") }
+		val imagesJson = extractScriptJson(doc, "__DATA__")
+			?.let { JSONObject(it).optJSONArray("images") }
 			?: throw ParseException("Image data not found", chapter.url)
+		val data = List(imagesJson.length()) { i -> imagesJson.getString(i) }
 
 		return data.map { imageUrl ->
 			MangaPage(
