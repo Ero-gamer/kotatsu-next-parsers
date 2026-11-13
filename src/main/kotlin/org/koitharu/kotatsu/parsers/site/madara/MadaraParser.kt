@@ -36,6 +36,9 @@ internal abstract class MadaraParser(
 	protected open val withoutAjax = false
 	protected open val authorSearchSupported = false
 
+	// For sites that mix manga with novels: lists only the titles whose chapters are images (ajax listings only)
+	protected open val mangaChaptersOnly = false
+
 	override val availableSortOrders: Set<SortOrder> = setupAvailableSortOrders()
 
 	private fun setupAvailableSortOrders(): Set<SortOrder> {
@@ -457,6 +460,11 @@ internal abstract class MadaraParser(
 					}
 			}
 
+			if (mangaChaptersOnly) {
+				payload["vars[meta_query][0][2][key]"] = "_wp_manga_chapter_type"
+				payload["vars[meta_query][0][2][value]"] = "manga"
+			}
+
 			return parseMangaList(
 				webClient.httpPost(
 					"https://$domain/wp-admin/admin-ajax.php",
@@ -544,6 +552,8 @@ internal abstract class MadaraParser(
 
 	protected open val selectDesc =
 		"div.description-summary div.summary__content, div.summary_content div.post-content_item > h5 + div, div.summary_content div.manga-excerpt, div.post-content div.manga-summary, div.post-content div.desc, div.c-page__content div.summary__content"
+	// The first heading of the page is not the title everywhere: see LekManga
+	protected open val selectTitle = "h1"
 	protected open val selectGenre = "div.genres-content a"
 	protected open val selectTestAsync = "div.listing-chapters_wrap"
 	protected open val selectState =
@@ -591,7 +601,7 @@ internal abstract class MadaraParser(
 		val alt = doc.body().select(selectAlt).firstOrNull()?.tableValue()?.textOrNull()
 
 		manga.copy(
-			title = doc.selectFirst("h1")?.textOrNull() ?: manga.title,
+			title = doc.selectFirst(selectTitle)?.textOrNull() ?: manga.title,
 			url = href,
 			publicUrl = href.toAbsoluteUrl(domain),
 			tags = doc.body().select(selectGenre).mapToSet { a -> createMangaTag(a) }.filterNotNull().toSet(),

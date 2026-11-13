@@ -1,0 +1,203 @@
+name: Publish parsers bundle
+
+# Makes the parsers of master available to the apps already installed, which take them in by themselves:
+# when they are next opened, when a manga is opened, or as soon as a source fails. Nobody is asked or told.
+#
+# Runs by itself after every commit on master that changes what the parsers are made of, and can be run by
+# hand from the Actions tab: the parsers are built, checked for fitting the apps they are meant for, signed and
+# uploaded. When the commit was pushed or merged by the owner, or the run started by them, it goes straight
+# through. For anyone else it waits for a reviewer to approve it. Nothing is tested against the sites here.
+# That is done for every pull request, before it is merged, by pull-request.yml. See docs/BUNDLE.md.
+on:
+  push:
+    branches:
+      - master
+    # What goes into the parsers: the list the pull request tests go by (SelectParserTestsTask), and the
+    # record of the contract, which the checks here read. A commit that touches none of it, the documents or
+    # a workflow say, would only make every app download the same parsers again. The same list is in the
+    # step "Make sure these are still the parsers on master" below: change both together
+    paths:
+      - 'src/main/**'
+      - 'src/contract/**'
+      - 'api/**'
+      - 'kotatsu-parsers-ksp/**'
+      - 'buildSrc/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time, in the order the commits came. While one runs, or waits for its confirmation, only the
+# newest of the later ones is kept waiting and the ones in between are dropped: what the newest publishes
+# contains theirs. Nothing running is ever cut off in the middle of publishing.
+concurrency:
+  group: parsers-bundle
+  cancel-in-progress: false
+
+defaults:
+  run:
+    # Said outright: only then does a step stop when a command in the middle of a pipe fails
+    shell: bash
+
+env:
+  RELEASE_TAG: parsers-bundle
+
+jobs:
+  # Has no secrets and can publish nothing: making a parser for every source runs code of each of them, which
+  # is never done in the job that signs. No site is visited.
+  #
+  # Only in this repository: a copy of it has neither the key nor anything to publish to, and every push to its
+  # master would otherwise end in a failed run. The jobs below need this one, so they are left out with it.
+  # Told by name, not by asking whether this is a fork: this repository is itself a fork, of the parsers it
+  # started from, and asking that left every run out here too. A renamed repository has to be renamed here.
+  check:
+    if: github.ref == 'refs/heads/master' && github.repository == 'Kotatsu-Redo/kotatsu-parsers-redo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # Fills the cache the pull request checks read from and cannot write to: what runs here is what is on
+      # master, and nothing of a pull request. The job that signs uses no cache at all
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Check that every source has its parser
+        run: ./gradlew test --tests '*ParsersBundleTest'
+
+  # For a run that somebody other than the owner started. The environment is what makes it wait: it has
+  # required reviewers, and nothing here goes on until one of them has approved it from the page of the run.
+  # The owner's own runs leave this job out.
+  #
+  # Only the first attempt of a run is ever asked about. Started again by somebody other than the owner, a
+  # run publishes nothing, whatever was approved before: what GitHub keeps of earlier attempts (the result of
+  # a job that is not run again, an approval already given) is not something to build a confirmation on.
+  # They start a new run, which is asked about afresh.
+  confirm:
+    needs: check
+    if: github.ref == 'refs/heads/master' && github.triggering_actor != 'clquwu' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    environment: parsers-bundle-review
+    permissions:
+      actions: read
+    steps:
+      # An environment that was never given reviewers lets everything through without asking anyone.
+      # So the approval itself is looked for, and anything but finding one stops the run.
+      - name: Make sure somebody confirmed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          approvals=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
+            --jq '[.[] | select(.state == "approved") | select(any(.environments[]; (.name | ascii_downcase) == "parsers-bundle-review"))] | length')
+          if [ "$approvals" -ge 1 ] 2> /dev/null; then
+            echo "Confirmed by a reviewer."
+          else
+            echo "::error::No approval of this run was found for the parsers-bundle-review environment. Give that environment required reviewers (Settings > Environments), then start a new run: this one cannot be started again."
+            exit 1
+          fi
+
+  # Only what is on master, and only once the check above has passed. Either the owner started this attempt
+  # of the run, and nobody has to be asked whatever happened in earlier attempts, or somebody else started
+  # the run and a reviewer said yes to this, its first attempt. Anything else publishes nothing: a check that
+  # failed, a run on another branch, a confirmation that was refused or never asked for, a run started again
+  # by somebody other than the owner.
+  #
+  # The signing key is a secret of this environment and not of the repository. The environment is set, in the
+  # repository's settings, to be used from master alone: a copy of this workflow on another branch, with the
+  # conditions here taken out, is still refused the key. See "The key" in docs/BUNDLE.md.
+  publish:
+    needs: [check, confirm]
+    if: >-
+      ${{
+        !cancelled() && github.ref == 'refs/heads/master' && needs.check.result == 'success' && (
+          github.triggering_actor == 'clquwu' ||
+          (github.run_attempt == 1 && needs.confirm.result == 'success')
+        )
+      }}
+    runs-on: ubuntu-latest
+    environment: PARSERS_SIGNING_KEY
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # A run publishes the commit it was started on, and can get here long after: it waited for its
+      # confirmation, or behind another run, or was started again. If what the parsers are made of is no longer
+      # the same on master, a newer commit or a revert, nothing is published here: a commit that changed it
+      # has a run of its own. A later commit that only touches something else, a document say, changes nothing
+      # of what goes out and does not stand in the way. The list is the one of `on.push.paths` above
+      - name: Make sure these are still the parsers on master
+        run: |
+          git fetch --quiet --no-tags --depth=1 origin refs/heads/master
+          if ! git diff --quiet "$GITHUB_SHA" FETCH_HEAD -- \
+              src/main src/contract api kotatsu-parsers-ksp buildSrc gradle \
+              build.gradle.kts settings.gradle.kts gradle.properties; then
+            echo "::error::The parsers on master are no longer the ones of this run: master is at $(git rev-parse FETCH_HEAD), this run is of $GITHUB_SHA, and what goes into the parsers differs between the two. Nothing is published here. If no newer run is publishing them, start one from the Actions tab."
+            exit 1
+          fi
+
+      # Built from nothing but the checkout: no cache another job could have written to
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          cache-disabled: true
+
+      # Fails, and publishes nothing, if the parsers no longer fit the apps they are meant for, or if what is
+      # published is already as new: an old run started again is not put over a later one.
+      # The parsers are compiled and packed here and nothing of them is run: the key is in this job
+      - name: Build and check
+        run: ./gradlew checkNewerThanPublished parsersBundleZip
+
+      # The key is there for this step alone, in which nothing is left to do but sign
+      - name: Sign
+        env:
+          PARSERS_SIGNING_KEY: ${{ secrets.PARSERS_SIGNING_KEY }}
+        run: ./gradlew parsersBundle
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: build/parsersBundle/out
+        run: |
+          if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --latest=false --title "Parsers bundle" \
+              --notes "Parsers for the apps already installed to take in by themselves. Written by the \"Publish parsers bundle\" workflow, not by hand: see docs/BUNDLE.md."
+          fi
+          # Exactly the file the manifest names, whatever else may be lying in the folder: anything more would be
+          # published too, and counted among the three that stay
+          manifest=$(ls parsers-v*.json)
+          file=$(grep -oE '"payload" *: *"[^"]*"' "$manifest" | cut -d'"' -f4 | base64 -d \
+            | grep -oE '"file" *: *"[^"]*"' | cut -d'"' -f4)
+          test -f "$file"
+          # The parsers first, and only then the manifest that points apps at them
+          gh release upload "$RELEASE_TAG" "$file" --clobber
+          gh release upload "$RELEASE_TAG" "$manifest" --clobber
+
+      # The three latest stay: an app that read the manifest a moment before this run still finds its file
+      - name: Remove older parsers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: build/parsersBundle/out
+        run: |
+          api=$(ls parsers-v*.json | sed -E 's/^parsers-v([0-9]+)\.json$/\1/')
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \
+            | grep -E "^parsers-v${api}-[0-9]+\.zip$" \
+            | sort -t- -k3,3n \
+            | head -n -3 \
+            | while read -r name; do gh release delete-asset "$RELEASE_TAG" "$name" --yes; done
