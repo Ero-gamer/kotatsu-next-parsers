@@ -58,7 +58,7 @@ jobs:
   # Told by name, not by asking whether this is a fork: this repository is itself a fork, of the parsers it
   # started from, and asking that left every run out here too. A renamed repository has to be renamed here.
   check:
-    if: github.ref == 'refs/heads/master' && github.repository == 'Kotatsu-Redo/kotatsu-parsers-redo'
+    if: github.ref == 'refs/heads/master' && github.repository == 'Ero-gamer/kotatsu-next-parsers'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -107,7 +107,7 @@ jobs:
     needs: check
     if: >-
       github.ref == 'refs/heads/master' && needs.check.outputs.changed == 'true' &&
-      github.triggering_actor != 'clquwu' && github.run_attempt == 1
+      github.triggering_actor != 'Ero-gamer' && github.run_attempt == 1
     runs-on: ubuntu-latest
     environment: parsers-bundle-review
     permissions:
@@ -144,7 +144,7 @@ jobs:
       ${{
         !cancelled() && github.ref == 'refs/heads/master' && needs.check.result == 'success' &&
         needs.check.outputs.changed == 'true' && (
-          github.triggering_actor == 'clquwu' ||
+          github.triggering_actor == 'Ero-gamer' ||
           (github.run_attempt == 1 && needs.confirm.result == 'success')
         )
       }}
