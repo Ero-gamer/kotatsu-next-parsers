@@ -1,0 +1,113 @@
+name: Setup parsers signing
+
+# One-time setup, run from the phone: makes the key pair the parsers bundle is signed with, stores the private half
+# as the PARSERS_SIGNING_KEY environment secret (it is never printed, never uploaded, never leaves GitHub), creates
+# the two environments, and points the publish workflow and gradle.properties at this repository and its key.
+# Needs a temporary token in the ADMIN_PAT repository secret: see the steps in the chat. Delete both afterwards.
+on:
+  workflow_dispatch:
+    inputs:
+      replace:
+        description: "Replace an existing key (every installed app that trusts the old one stops taking parsers)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      REPLACE: ${{ inputs.replace }}
+    steps:
+      - name: Check the token
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::The ADMIN_PAT secret is missing. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          gh api "repos/$REPO" --jq .full_name
+
+      - name: Stop if a key already exists
+        run: |
+          set -euo pipefail
+          if gh api "repos/$REPO/environments/PARSERS_SIGNING_KEY/secrets" --jq '.secrets[].name' 2> /dev/null | grep -qx PARSERS_SIGNING_KEY \
+            && [ "$REPLACE" != "true" ]; then
+            echo "::error::A key already exists. Run again with 'replace' ticked only if you really want a new one."
+            exit 1
+          fi
+
+      - name: Create the environments
+        run: |
+          set -euo pipefail
+          uid=$(gh api user --jq .id)
+          # Signing environment: master only, no reviewers
+          gh api -X PUT "repos/$REPO/environments/PARSERS_SIGNING_KEY" --input - <<< \
+            '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' > /dev/null
+          if ! gh api "repos/$REPO/environments/PARSERS_SIGNING_KEY/deployment-branch-policies" --jq '.branch_policies[].name' | grep -qx master; then
+            gh api -X POST "repos/$REPO/environments/PARSERS_SIGNING_KEY/deployment-branch-policies" -f name=master -f type=branch > /dev/null
+          fi
+          # Review environment, for runs started by anybody but the owner: the owner is the reviewer
+          gh api -X PUT "repos/$REPO/environments/parsers-bundle-review" --input - <<< \
+            "{\"reviewers\":[{\"type\":\"User\",\"id\":$uid}]}" > /dev/null
+          echo "Environments ready."
+
+      - name: Make the key pair and store the private half
+        id: keys
+        run: |
+          set -euo pipefail
+          umask 077
+          openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out "$RUNNER_TEMP/key.pem"
+          pub=$(openssl pkey -in "$RUNNER_TEMP/key.pem" -pubout -outform DER | base64 -w0)
+          gh secret set PARSERS_SIGNING_KEY --env PARSERS_SIGNING_KEY --repo "$REPO" < "$RUNNER_TEMP/key.pem"
+          shred -u "$RUNNER_TEMP/key.pem" || rm -f "$RUNNER_TEMP/key.pem"
+          echo "pub=$pub" >> "$GITHUB_OUTPUT"
+          echo "Private key stored as the PARSERS_SIGNING_KEY environment secret."
+
+      - name: Point the workflow and gradle.properties at this repository and key
+        env:
+          PUB: ${{ steps.keys.outputs.pub }}
+        run: |
+          set -euo pipefail
+          put() { # path, local file, message
+            local sha
+            sha=$(gh api "repos/$REPO/contents/$1?ref=master" --jq .sha)
+            gh api -X PUT "repos/$REPO/contents/$1" -f message="$3" -f branch=master -f sha="$sha" \
+              -f content="$(base64 -w0 "$2")" > /dev/null
+          }
+          get() { gh api "repos/$REPO/contents/$1?ref=master" --jq .content | base64 -d > "$2"; }
+
+          wf=.github/workflows/publish-parsers-bundle.yml
+          get "$wf" "$RUNNER_TEMP/wf.yml"
+          sed -i "s#'Kotatsu-Redo/kotatsu-parsers-redo'#'$REPO'#; s#'clquwu'#'$OWNER'#g" "$RUNNER_TEMP/wf.yml"
+          grep -q "'$REPO'" "$RUNNER_TEMP/wf.yml"
+          grep -q "'$OWNER'" "$RUNNER_TEMP/wf.yml"
+          if ! grep -q "clquwu\|Kotatsu-Redo/kotatsu-parsers-redo" "$RUNNER_TEMP/wf.yml"; then echo "workflow patched"; fi
+          put "$wf" "$RUNNER_TEMP/wf.yml" "Publish workflow: use this repository and its owner"
+
+          get gradle.properties "$RUNNER_TEMP/gp.properties"
+          sed -i "s#^parsersPublicKey=.*#parsersPublicKey=$PUB#" "$RUNNER_TEMP/gp.properties"
+          grep -q "^parsersPublicKey=$PUB\$" "$RUNNER_TEMP/gp.properties"
+          put gradle.properties "$RUNNER_TEMP/gp.properties" "Parsers bundle: public key of the signing pair"
+
+      - name: Show the public key
+        env:
+          PUB: ${{ steps.keys.outputs.pub }}
+        run: |
+          {
+            echo "### Public key (not secret)"
+            echo
+            echo "Paste it in the app: \`app/build.gradle.kts\`, line \`val parsersBundlePublicKey = \"...\"\`"
+            echo
+            echo '```'
+            echo "$PUB"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Public key: $PUB"
